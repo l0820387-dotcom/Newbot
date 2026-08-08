@@ -1,0 +1,48 @@
+{
+  "rules": {
+    "products": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "orders": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "users": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "walletTransactions": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "referralSettings": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "broadcastQueue": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "coupons": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "botSettings": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "proPlanSettings": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "reviews": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "admins": {
+      ".read": "auth != null",
+      ".write": false
+    }
+  }
+}

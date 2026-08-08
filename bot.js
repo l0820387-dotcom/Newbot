@@ -1,0 +1,1116 @@
+require('dotenv').config();
+const { Telegraf, Markup } = require('telegraf');
+const express = require('express');
+const fb = require('./firebase');
+const zabupi = require('./zabupi');
+
+const bot = new Telegraf(process.env.BOT_TOKEN);
+const app = express();
+app.use(express.json());
+
+// In-memory temp state (for multi-step flows like "buy via wallet confirm")
+const userState = {}; // { telegramId: { step, data } }
+
+// ============ BAN CHECK MIDDLEWARE ============
+
+bot.use(async (ctx, next) => {
+  if (!ctx.from) return next();
+  const banned = await fb.isUserBanned(ctx.from.id);
+  if (banned) {
+    return ctx.reply('🚫 Aapko is bot se block kar diya gaya hai. Support se contact karo agar galti lagti hai.');
+  }
+  return next();
+});
+
+// ============ MANDATORY CHANNEL JOIN MIDDLEWARE ============
+// Blocks all bot interaction until user joins the configured channel.
+// Skips the check itself for the "check_joined" button so users can retry.
+
+bot.use(async (ctx, next) => {
+  if (!ctx.from) return next();
+
+  // Let the "I've Joined" button always through (it does the check itself)
+  if (ctx.callbackQuery && ctx.callbackQuery.data === 'check_joined') return next();
+
+  const settings = await fb.getBotSettings();
+  if (!settings.channelRequired || !settings.channelUsername) return next();
+
+  const isMember = await checkChannelMembership(ctx.from.id, settings.channelUsername);
+  if (!isMember) {
+    await sendJoinPrompt(ctx, settings.channelUsername);
+    return; // block everything else
+  }
+
+  return next();
+});
+
+async function checkChannelMembership(telegramId, channelUsername) {
+  try {
+    const handle = channelUsername.startsWith('@') ? channelUsername : `@${channelUsername}`;
+    const member = await bot.telegram.getChatMember(handle, telegramId);
+    return ['member', 'administrator', 'creator'].includes(member.status);
+  } catch (err) {
+    console.error('Channel membership check failed:', err.message);
+    // If the bot isn't an admin in the channel or channel is misconfigured,
+    // fail open so the bot doesn't block everyone due to a config mistake.
+    return true;
+  }
+}
+
+async function sendJoinPrompt(ctx, channelUsername) {
+  const handle = channelUsername.startsWith('@') ? channelUsername.slice(1) : channelUsername;
+  await ctx.reply(
+    `📢 *Ek chhota sa step baaki hai!*\n\nBot use karne se pehle humara channel join karo:`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.url('📢 Join Channel', `https://t.me/${handle}`)],
+        [Markup.button.callback('✅ I\'ve Joined', 'check_joined')]
+      ])
+    }
+  );
+}
+
+bot.action('check_joined', async (ctx) => {
+  const settings = await fb.getBotSettings();
+  const isMember = await checkChannelMembership(ctx.from.id, settings.channelUsername);
+
+  if (isMember) {
+    await ctx.answerCbQuery('✅ Verified!');
+    const telegramId = ctx.from.id;
+    await fb.createUserIfNotExists(telegramId, ctx.from, null);
+    await sendMainMenu(ctx);
+  } else {
+    await ctx.answerCbQuery('❌ Abhi bhi join nahi kiya. Pehle channel join karo.', { show_alert: true });
+  }
+});
+
+// ============ START / REGISTER ============
+
+bot.start(async (ctx) => {
+  const telegramId = ctx.from.id;
+  const payload = ctx.startPayload; // referral code if /start?start=REF123456
+
+  await fb.createUserIfNotExists(telegramId, ctx.from, payload);
+  await sendMainMenu(ctx);
+});
+
+async function sendMainMenu(ctx) {
+  const settings = await fb.getBotSettings();
+  const text = settings.welcomeMessage.replace('{name}', ctx.from.first_name);
+
+  await ctx.reply(text, { parse_mode: 'Markdown', ...mainMenu() });
+}
+
+function mainMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('👤 My Profile', 'menu_profile')],
+    [Markup.button.callback('🛍 Browse Products', 'menu_browse')],
+    [Markup.button.callback('🎁 Free Products', 'menu_free')],
+    [Markup.button.callback('👑 Pro Plan', 'menu_proplan'), Markup.button.callback('📦 My Purchases', 'menu_purchases')],
+    [Markup.button.callback('📋 Order Status', 'menu_orders'), Markup.button.callback('🔗 My Referrals', 'menu_referrals')],
+    [Markup.button.callback('📊 My Stats', 'menu_stats'), Markup.button.callback('🧾 Payment History', 'menu_paymenthistory')],
+    [Markup.button.callback('📞 Support', 'menu_support'), Markup.button.callback('🌐 Hindi / English', 'menu_language')]
+  ]);
+}
+
+bot.action('menu_home', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendMainMenu(ctx);
+});
+
+// ============ MY PROFILE ============
+
+bot.action('menu_profile', async (ctx) => {
+  await ctx.answerCbQuery();
+  const telegramId = ctx.from.id;
+  const user = await fb.getUser(telegramId);
+  const balance = await fb.getWalletBalance(telegramId);
+  const isVip = await fb.isUserVip(telegramId);
+  const vipDays = isVip ? await fb.getVipDaysLeft(telegramId) : 0;
+  const orders = await fb.getUserOrders(telegramId);
+  const orderCount = Object.keys(orders).length;
+
+  const vipLine = isVip ? `👑 VIP Active — ${vipDays} days left` : '👤 Free User';
+
+  const msg = `👤 *My Profile*\n\nName: ${user.name}\nUsername: ${user.username ? '@' + user.username : '-'}\nTelegram ID: \`${telegramId}\`\n\n${vipLine}\n💰 Wallet: ₹${balance}\n📦 Total Orders: ${orderCount}\n🔗 Referral Code: ${user.referralCode}`;
+
+  await ctx.reply(msg, { parse_mode: 'Markdown', ...backButton() });
+});
+
+function backButton() {
+  return Markup.inlineKeyboard([[Markup.button.callback('🏠 Home', 'menu_home')]]);
+}
+
+// ============ PRO PLAN ============
+
+bot.action('menu_proplan', async (ctx) => {
+  await ctx.answerCbQuery();
+  const telegramId = ctx.from.id;
+  const settings = await fb.getProPlanSettings();
+  const isVip = await fb.isUserVip(telegramId);
+
+  if (isVip) {
+    const daysLeft = await fb.getVipDaysLeft(telegramId);
+    return ctx.reply(
+      `👑 *You're already VIP!*\n\n${daysLeft} days remaining.\n\nWant to extend? Buy again to add more days.`,
+      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
+        [Markup.button.callback(`💳 Extend — ₹${settings.price}`, 'buyproplan')],
+        [Markup.button.callback('🏠 Home', 'menu_home')]
+      ])}
+    );
+  }
+
+  const msg = `👑 *Upgrade to VIP*\n\n💰 ₹${settings.price} · ${settings.description}\n\n✨ *What you unlock:*\n✅ ${settings.durationDays} din unlimited downloads\n✅ Koi bhi paid product FREE\n✅ Wallet balance ki zarurat nahi\n✅ Naye products bhi free\n\n🛡 Secure UPI payment · Instant activation`;
+
+  await ctx.reply(msg, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback(`💳 Upgrade Now — ₹${settings.price}`, 'buyproplan')],
+      [Markup.button.callback('🏠 Home', 'menu_home')]
+    ])
+  });
+});
+
+bot.action('buyproplan', async (ctx) => {
+  await ctx.answerCbQuery('Generating payment link...');
+  const telegramId = ctx.from.id;
+  const settings = await fb.getProPlanSettings();
+
+  const order = await fb.createOrder({
+    userId: String(telegramId),
+    productId: 'PRO_PLAN',
+    productName: `Pro Plan (${settings.durationDays} days)`,
+    amount: settings.price,
+    paymentMethod: 'zabupi',
+    isProPlan: true,
+    proPlanDuration: settings.durationDays
+  });
+
+  const payment = await zabupi.createPaymentOrder({
+    orderId: order.id,
+    amount: settings.price,
+    userId: telegramId,
+    userName: ctx.from.first_name,
+    purpose: 'Pro Plan Subscription'
+  });
+
+  if (!payment.success) {
+    await fb.updateOrderStatus(order.id, 'failed');
+    return ctx.reply('❌ Payment link generate nahi ho payi. Thodi der baad try karo.');
+  }
+
+  await fb.updateOrderStatus(order.id, 'pending', { zabupiTxnId: payment.transactionId });
+
+  await ctx.reply(
+    `💳 *Pro Plan* — ₹${settings.price}\n\nPay karke turant VIP activate ho jayega ✅`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.url('💳 Pay Now', payment.paymentUrl)]]) }
+  );
+});
+
+// ============ FREE PRODUCTS ============
+
+bot.action('menu_free', async (ctx) => {
+  await ctx.answerCbQuery();
+  const all = await fb.getAllProducts(true);
+  const freeIds = Object.entries(all).filter(([id, p]) => p.price === 0).map(([id]) => id);
+
+  if (freeIds.length === 0) {
+    return ctx.reply('Abhi koi free product available nahi hai. 🙏', backButton());
+  }
+
+  for (const id of freeIds) {
+    await sendProductCard(ctx, id, all[id]);
+  }
+  await ctx.reply('👆 Free products', backButton());
+});
+
+// ============ ORDER STATUS ============
+
+bot.action('menu_orders', async (ctx) => {
+  await ctx.answerCbQuery();
+  const orders = await fb.getUserOrders(ctx.from.id);
+  const list = Object.values(orders).sort((a, b) => b.createdAt - a.createdAt);
+
+  if (list.length === 0) {
+    return ctx.reply('Abhi tak koi order nahi hai.', backButton());
+  }
+
+  let msg = '📋 *Order Status*\n\n';
+  list.slice(0, 10).forEach(o => {
+    const statusEmoji = o.status === 'delivered' ? '✅' : o.status === 'pending' ? '⏳' : o.status === 'failed' ? '❌' : o.status === 'refunded' ? '↩️' : '🔄';
+    msg += `${statusEmoji} ${o.productName} — ₹${o.amount} (${o.status})\n`;
+  });
+
+  await ctx.reply(msg, { parse_mode: 'Markdown' });
+
+  const refundable = list.find(o => o.status === 'delivered' && !o.refundStatus && o.productId !== 'PRO_PLAN' && o.productId !== 'WALLET_TOPUP');
+  if (refundable) {
+    await ctx.reply(
+      `Order "${refundable.productName}" ke liye refund chahiye?`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback('↩️ Request Refund', `refund_${refundable.id}`)],
+        [Markup.button.callback('🏠 Home', 'menu_home')]
+      ])
+    );
+  } else {
+    await ctx.reply('👆', backButton());
+  }
+});
+
+// ============ MY STATS ============
+
+bot.action('menu_stats', async (ctx) => {
+  await ctx.answerCbQuery();
+  const telegramId = ctx.from.id;
+  const orders = await fb.getUserOrders(telegramId);
+  const list = Object.values(orders);
+  const paidOrders = list.filter(o => o.status === 'paid' || o.status === 'delivered');
+  const totalSpent = paidOrders.reduce((sum, o) => sum + (o.amount || 0), 0);
+  const user = await fb.getUser(telegramId);
+
+  const msg = `📊 *My Stats*\n\n🛒 Total Orders: ${list.length}\n✅ Completed: ${paidOrders.length}\n💰 Total Spent: ₹${totalSpent}\n📅 Member since: ${new Date(user.joinedAt).toLocaleDateString()}`;
+
+  await ctx.reply(msg, { parse_mode: 'Markdown', ...backButton() });
+});
+
+// ============ PAYMENT HISTORY ============
+
+bot.action('menu_paymenthistory', async (ctx) => {
+  await ctx.answerCbQuery();
+  const txns = await new Promise((resolve) => {
+    fb.db.ref('walletTransactions').orderByChild('userId').equalTo(String(ctx.from.id)).once('value', snap => {
+      resolve(snap.exists() ? Object.values(snap.val()) : []);
+    });
+  });
+
+  if (txns.length === 0) {
+    return ctx.reply('Koi payment history nahi mili.', backButton());
+  }
+
+  let msg = '🧾 *Payment History*\n\n';
+  txns.sort((a, b) => b.createdAt - a.createdAt).slice(0, 10).forEach(t => {
+    const emoji = t.type === 'credit' ? '➕' : '➖';
+    msg += `${emoji} ₹${t.amount} — ${t.reason} (${new Date(t.createdAt).toLocaleDateString()})\n`;
+  });
+
+  await ctx.reply(msg, { parse_mode: 'Markdown', ...backButton() });
+});
+
+// ============ LANGUAGE ============
+
+bot.action('menu_language', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply('🌐 Abhi sirf Hinglish support hai. Full Hindi/English switch jaldi aa raha hai! 🙏', backButton());
+});
+
+// ============ SUPPORT (menu action version) ============
+
+bot.action('menu_support', async (ctx) => {
+  await ctx.answerCbQuery();
+  const settings = await fb.getBotSettings();
+
+  let msg = `📞 *Customer Support*\n\nKoi bhi issue ho, humse contact karo:\n\n`;
+  const buttons = [];
+
+  if (settings.supportTelegram) {
+    const handle = settings.supportTelegram.replace('@', '');
+    msg += `💬 Telegram: @${handle}\n`;
+    buttons.push([Markup.button.url('💬 Message on Telegram', `https://t.me/${handle}`)]);
+  }
+  if (settings.supportWhatsapp) {
+    const number = settings.supportWhatsapp.replace(/[^0-9]/g, '');
+    msg += `📱 WhatsApp: +${number}\n`;
+    buttons.push([Markup.button.url('📱 Message on WhatsApp', `https://wa.me/${number}`)]);
+  }
+  if (!settings.supportTelegram && !settings.supportWhatsapp) {
+    msg += 'Support details jaldi update honge.';
+  }
+
+  buttons.push([Markup.button.callback('🏠 Home', 'menu_home')]);
+  await ctx.reply(msg, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+});
+
+// ============ MY PURCHASES ============
+
+bot.action('menu_purchases', async (ctx) => {
+  await ctx.answerCbQuery();
+  const orders = await fb.getUserOrders(ctx.from.id);
+  const delivered = Object.values(orders).filter(o => o.status === 'delivered').sort((a, b) => b.createdAt - a.createdAt);
+
+  if (delivered.length === 0) {
+    return ctx.reply('Abhi tak koi purchase nahi hai.', backButton());
+  }
+
+  let msg = '📦 *My Purchases*\n\n';
+  delivered.slice(0, 10).forEach(o => {
+    msg += `✅ ${o.productName} — ₹${o.amount}\n`;
+  });
+
+  await ctx.reply(msg, { parse_mode: 'Markdown', ...backButton() });
+});
+
+// ============ MY REFERRALS (menu action version) ============
+
+bot.action('menu_referrals', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendReferralInfo(ctx);
+});
+
+async function sendReferralInfo(ctx) {
+  const user = await fb.getUser(ctx.from.id);
+  const settings = await fb.getReferralSettings();
+  const botInfo = await bot.telegram.getMe();
+
+  const link = `https://t.me/${botInfo.username}?start=${user.referralCode}`;
+  const bonusText = settings.bonusType === 'percent'
+    ? `${settings.bonusAmount}% of their first purchase`
+    : `₹${settings.bonusAmount}`;
+
+  await ctx.reply(
+    `🔗 *My Referrals*\n\nApne friends ko invite karo aur unki pehli purchase pe *${bonusText}* wallet bonus paao!\n\nYour referral link:\n${link}`,
+    { parse_mode: 'Markdown', ...backButton() }
+  );
+}
+
+// ============ BROWSE PRODUCTS ============
+
+bot.action('menu_browse', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showCategories(ctx);
+});
+
+// ============ PRODUCTS / CATALOG ============
+
+async function showCategories(ctx) {
+  const categories = await fb.getAllCategories();
+  if (categories.length === 0) {
+    return ctx.reply('Abhi koi product available nahi hai. Jaldi aayega! 🙏', backButton());
+  }
+
+  const buttons = categories.map(cat => [Markup.button.callback(`📁 ${cat}`, `cat_${cat}`)]);
+  buttons.push([Markup.button.callback('🏠 Home', 'menu_home')]);
+  await ctx.reply('Category choose karo:', Markup.inlineKeyboard(buttons));
+}
+
+bot.action(/^cat_(.+)$/, async (ctx) => {
+  const category = ctx.match[1];
+  const products = await fb.getProductsByCategory(category);
+  const ids = Object.keys(products);
+
+  if (ids.length === 0) {
+    return ctx.answerCbQuery('Is category mein abhi product nahi hai.');
+  }
+
+  await ctx.answerCbQuery();
+  for (const id of ids) {
+    await sendProductCard(ctx, id, products[id]);
+  }
+});
+
+// ---- Reusable product card sender (used by category browse + search) ----
+async function sendProductCard(ctx, id, p) {
+  const { avg, count } = await fb.getProductAvgRating(id);
+  const ratingLine = count > 0 ? `\n⭐ ${avg}/5 (${count} reviews)` : '';
+  const stockLine = (p.stock !== undefined && p.stock !== -1) ? `\n📦 Stock: ${p.stock}` : '';
+
+  const caption = `*${p.name}*\n\n${p.description || ''}\n\n💰 Price: ₹${p.price}${ratingLine}${stockLine}`;
+  const buttons = Markup.inlineKeyboard([
+    [Markup.button.callback('🛒 Buy Now', `buy_${id}`)],
+    [Markup.button.callback('⭐ Reviews', `reviews_${id}`)]
+  ]);
+
+  // Support multiple images (imageUrls array) or fallback to single imageUrl
+  const images = Array.isArray(p.imageUrls) && p.imageUrls.length > 0 ? p.imageUrls : (p.imageUrl ? [p.imageUrl] : []);
+
+  if (images.length > 1) {
+    const mediaGroup = images.map((url, i) => ({
+      type: 'photo',
+      media: url,
+      caption: i === 0 ? caption : undefined,
+      parse_mode: i === 0 ? 'Markdown' : undefined
+    }));
+    await ctx.replyWithMediaGroup(mediaGroup);
+    await ctx.reply('👆 Product images', buttons);
+  } else if (images.length === 1) {
+    await ctx.replyWithPhoto(images[0], { caption, parse_mode: 'Markdown', ...buttons });
+  } else {
+    await ctx.reply(caption, { parse_mode: 'Markdown', ...buttons });
+  }
+}
+
+// ============ SEARCH ============
+
+bot.command('search', async (ctx) => {
+  userState[ctx.from.id] = { step: 'awaiting_search_query' };
+  await ctx.reply('🔍 Product ka naam type karo dhundhne ke liye:');
+});
+
+// ============ REVIEWS ============
+
+bot.action(/^reviews_(.+)$/, async (ctx) => {
+  const productId = ctx.match[1];
+  await ctx.answerCbQuery();
+
+  const reviews = await fb.getProductReviews(productId);
+  const list = Object.values(reviews).sort((a, b) => b.createdAt - a.createdAt);
+
+  if (list.length === 0) {
+    return ctx.reply(
+      'Abhi koi review nahi hai. Purchase karne ke baad tum pehla review de sakte ho! 🙌',
+      Markup.inlineKeyboard([[Markup.button.callback('✍️ Write a Review', `writereview_${productId}`)]])
+    );
+  }
+
+  let msg = `⭐ *Reviews*\n\n`;
+  list.slice(0, 8).forEach(r => {
+    const stars = '⭐'.repeat(r.rating);
+    msg += `${stars} — ${r.userName}\n${r.comment ? r.comment + '\n' : ''}\n`;
+  });
+
+  await ctx.reply(msg, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('✍️ Write a Review', `writereview_${productId}`)]])
+  });
+});
+
+bot.action(/^writereview_(.+)$/, async (ctx) => {
+  const productId = ctx.match[1];
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    'Rating do (1-5 stars):',
+    Markup.inlineKeyboard([
+      [1, 2, 3, 4, 5].map(n => Markup.button.callback('⭐'.repeat(n), `rate_${productId}_${n}`))
+    ])
+  );
+});
+
+bot.action(/^rate_(.+)_(\d)$/, async (ctx) => {
+  const productId = ctx.match[1];
+  const rating = parseInt(ctx.match[2]);
+  await ctx.answerCbQuery();
+
+  userState[ctx.from.id] = { step: 'awaiting_review_comment', data: { productId, rating } };
+  await ctx.reply('Ek chhota comment likho (ya "skip" bhejo):');
+});
+
+// ============ BUY FLOW ============
+
+bot.action(/^buy_(.+)$/, async (ctx) => {
+  const productId = ctx.match[1];
+  const product = await fb.getProduct(productId);
+  const telegramId = ctx.from.id;
+
+  if (!product || !product.active) {
+    return ctx.answerCbQuery('Yeh product available nahi hai.');
+  }
+
+  // Already bought? Don't let them pay again — offer re-delivery instead.
+  const alreadyBought = await fb.hasUserBoughtProduct(telegramId, productId);
+  if (alreadyBought) {
+    await ctx.answerCbQuery();
+    return ctx.reply(
+      `✅ Yeh product aap pehle hi khareed chuke ho!\n\n*${product.name}*\n\nDobara download karna hai?`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('📥 Re-download', `redeliver_${productId}`)],
+          [Markup.button.callback('🏠 Home', 'menu_home')]
+        ])
+      }
+    );
+  }
+
+  if (product.stock !== undefined && product.stock !== -1 && product.stock <= 0) {
+    return ctx.answerCbQuery('Yeh product abhi out of stock hai.');
+  }
+
+  await ctx.answerCbQuery();
+
+  // VIP users get every paid product free, instantly
+  const isVip = await fb.isUserVip(telegramId);
+  if (isVip && product.price > 0) {
+    const order = await fb.createOrder({
+      userId: String(telegramId),
+      productId,
+      productName: product.name,
+      amount: 0,
+      originalAmount: product.price,
+      paymentMethod: 'vip_free'
+    });
+    await fb.updateOrderStatus(order.id, 'paid');
+    await fb.decrementStock(productId);
+    await checkAndAlertLowStock(productId);
+    return deliverProduct(ctx, product, order.id);
+  }
+
+  await showOrderSummary(ctx, productId, product, null);
+});
+
+async function showOrderSummary(ctx, productId, product, appliedCoupon) {
+  const balance = await fb.getWalletBalance(ctx.from.id);
+
+  let finalPrice = product.price;
+  let couponLine = '';
+  if (appliedCoupon) {
+    finalPrice = Math.max(0, product.price - appliedCoupon.discount);
+    couponLine = `\n🎟 Coupon "${appliedCoupon.code}" applied: -₹${appliedCoupon.discount}`;
+  }
+
+  const couponSuffix = appliedCoupon ? `_${appliedCoupon.code}` : '';
+
+  const buttons = [
+    [Markup.button.callback('💰 Pay via Wallet', `paywallet_${productId}${couponSuffix}`)],
+    [Markup.button.callback('💳 Pay via Zabupi', `payzabupi_${productId}${couponSuffix}`)]
+  ];
+  if (!appliedCoupon) {
+    buttons.push([Markup.button.callback('🎟 Apply Coupon', `applycoupon_${productId}`)]);
+  }
+  buttons.push([Markup.button.callback('👑 Get Free with Pro Plan', 'menu_proplan')]);
+
+  const text = `🧾 Order Summary\n\n*${product.name}*\nPrice: ₹${product.price}${couponLine}\n\n*Total: ₹${finalPrice}*\nWallet Balance: ₹${balance}\n\nPayment method choose karo:`;
+
+  await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+}
+
+bot.action(/^applycoupon_(.+)$/, async (ctx) => {
+  const productId = ctx.match[1];
+  await ctx.answerCbQuery();
+  userState[ctx.from.id] = { step: 'awaiting_coupon_code', data: { productId } };
+  await ctx.reply('🎟 Coupon code type karo:');
+});
+
+// ---- Pay via Wallet ----
+bot.action(/^paywallet_([^_]+)(?:_(.+))?$/, async (ctx) => {
+  const productId = ctx.match[1];
+  const couponCode = ctx.match[2];
+  const telegramId = ctx.from.id;
+  const product = await fb.getProduct(productId);
+
+  if (!product) return ctx.answerCbQuery('Product not found.');
+
+  if (productId !== 'PRO_PLAN' && await fb.hasUserBoughtProduct(telegramId, productId)) {
+    await ctx.answerCbQuery();
+    return ctx.reply('✅ Yeh product aap pehle hi khareed chuke ho.');
+  }
+
+  let finalPrice = product.price;
+  let couponUsed = null;
+  if (couponCode) {
+    const check = await fb.validateCoupon(couponCode, product.price);
+    if (check.valid) {
+      finalPrice = Math.max(0, product.price - check.discount);
+      couponUsed = couponCode;
+    }
+  }
+
+  const balance = await fb.getWalletBalance(telegramId);
+  if (balance < finalPrice) {
+    await ctx.answerCbQuery();
+    return ctx.reply(`❌ Insufficient wallet balance.\n\nBalance: ₹${balance}\nRequired: ₹${finalPrice}\n\nZabupi se add money karo pehle.`);
+  }
+
+  await ctx.answerCbQuery('Processing...');
+
+  try {
+    if (finalPrice > 0) await fb.debitWallet(telegramId, finalPrice, 'purchase');
+
+    const order = await fb.createOrder({
+      userId: String(telegramId),
+      productId,
+      productName: product.name,
+      amount: finalPrice,
+      originalAmount: product.price,
+      couponUsed: couponUsed || null,
+      paymentMethod: 'wallet'
+    });
+
+    await fb.updateOrderStatus(order.id, 'paid');
+    if (couponUsed) await fb.incrementCouponUsage(couponUsed);
+    await fb.processReferralBonus(telegramId, finalPrice);
+    await fb.decrementStock(productId);
+    await checkAndAlertLowStock(productId);
+
+    await deliverProduct(ctx, product, order.id);
+  } catch (err) {
+    console.error(err);
+    await ctx.reply('❌ Payment failed. Please try again or contact support.');
+  }
+});
+
+// ---- Pay via Zabupi ----
+bot.action(/^payzabupi_([^_]+)(?:_(.+))?$/, async (ctx) => {
+  const productId = ctx.match[1];
+  const couponCode = ctx.match[2];
+  const telegramId = ctx.from.id;
+  const product = await fb.getProduct(productId);
+
+  if (!product) return ctx.answerCbQuery('Product not found.');
+
+  if (productId !== 'PRO_PLAN' && await fb.hasUserBoughtProduct(telegramId, productId)) {
+    await ctx.answerCbQuery();
+    return ctx.reply('✅ Yeh product aap pehle hi khareed chuke ho.');
+  }
+
+  let finalPrice = product.price;
+  let couponUsed = null;
+  if (couponCode) {
+    const check = await fb.validateCoupon(couponCode, product.price);
+    if (check.valid) {
+      finalPrice = Math.max(0, product.price - check.discount);
+      couponUsed = couponCode;
+    }
+  }
+
+  await ctx.answerCbQuery('Generating payment link...');
+
+  const order = await fb.createOrder({
+    userId: String(telegramId),
+    productId,
+    productName: product.name,
+    amount: finalPrice,
+    originalAmount: product.price,
+    couponUsed: couponUsed || null,
+    paymentMethod: 'zabupi'
+  });
+
+  const payment = await zabupi.createPaymentOrder({
+    orderId: order.id,
+    amount: finalPrice,
+    userId: telegramId,
+    userName: ctx.from.first_name,
+    purpose: product.name
+  });
+
+  if (!payment.success) {
+    await fb.updateOrderStatus(order.id, 'failed');
+    return ctx.reply('❌ Payment link generate nahi ho payi. Thodi der baad try karo.');
+  }
+
+  await fb.updateOrderStatus(order.id, 'pending', { zabupiTxnId: payment.transactionId });
+
+  await ctx.reply(
+    `💳 Payment link ready!\n\n*${product.name}* — ₹${finalPrice}\n\nNeeche link pe click karke payment complete karo. Payment hote hi product turant deliver ho jaayega ✅`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.url('💳 Pay Now', payment.paymentUrl)]
+      ])
+    }
+  );
+});
+
+// ---- Low stock alert helper ----
+async function checkAndAlertLowStock(productId) {
+  const alert = await fb.checkLowStock(productId);
+  if (!alert) return;
+
+  const adminIds = (process.env.ADMIN_TELEGRAM_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+  for (const adminId of adminIds) {
+    try {
+      await bot.telegram.sendMessage(adminId, `⚠️ *Low Stock Alert*\n\n"${alert.productName}" — only ${alert.stock} left!`, { parse_mode: 'Markdown' });
+    } catch (e) {}
+  }
+}
+
+// ============ PRODUCT DELIVERY ============
+
+bot.action(/^redeliver_(.+)$/, async (ctx) => {
+  const productId = ctx.match[1];
+  await ctx.answerCbQuery();
+  const product = await fb.getProduct(productId);
+  if (!product) return ctx.reply('Product not found.');
+
+  await deliverProduct(ctx, product, null, true);
+});
+
+async function deliverProduct(ctx, product, orderId, silent) {
+  if (!silent) {
+    await ctx.reply(`✅ Payment successful! Delivering *${product.name}*...`, { parse_mode: 'Markdown' });
+  }
+
+  try {
+    if (product.deliveryType === 'file' && product.fileId) {
+      await ctx.replyWithDocument(product.fileId, {
+        caption: `📦 ${product.name}\n\nThank you for your purchase! 🙏`
+      });
+    } else if (product.deliveryType === 'link' && product.deliveryLink) {
+      await ctx.reply(
+        `📦 *${product.name}*\n\n🔗 Download Link:\n${product.deliveryLink}\n\nThank you for your purchase! 🙏`,
+        { parse_mode: 'Markdown' }
+      );
+    } else {
+      await ctx.reply('⚠️ Delivery content set nahi hai. Support se contact karo, jald hi resolve hoga.');
+    }
+
+    if (orderId) {
+      await fb.updateOrderStatus(orderId, 'delivered', { deliveredAt: Date.now() });
+    }
+  } catch (err) {
+    console.error('Delivery error:', err);
+    await ctx.reply('⚠️ Delivery mein issue aaya. Support team ko inform kar diya gaya hai.');
+  }
+}
+
+// ============ WALLET (accessible via /wallet command, add money still used in checkout) ============
+
+bot.command('wallet', async (ctx) => {
+  const balance = await fb.getWalletBalance(ctx.from.id);
+  await ctx.reply(
+    `💰 *Your Wallet*\n\nBalance: ₹${balance}`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('➕ Add Money', 'addmoney')],
+        [Markup.button.callback('🏠 Home', 'menu_home')]
+      ])
+    }
+  );
+});
+
+bot.action('addmoney', async (ctx) => {
+  await ctx.answerCbQuery();
+  userState[ctx.from.id] = { step: 'awaiting_addmoney_amount' };
+  await ctx.reply('Kitna amount add karna hai? (₹ mein number bhejo, e.g. 100)');
+});
+
+// ---- Refund request action (triggered from Order Status / My Purchases) ----
+bot.action(/^refund_(.+)$/, async (ctx) => {
+  const orderId = ctx.match[1];
+  await ctx.answerCbQuery();
+  userState[ctx.from.id] = { step: 'awaiting_refund_reason', data: { orderId } };
+  await ctx.reply('Refund ka reason likho:');
+});
+
+// ============ ADMIN COMMANDS ============
+
+bot.command('salesreport', async (ctx) => {
+  if (!fb.isAdmin(ctx.from.id)) return;
+
+  const weekly = await fb.getSalesReport(7);
+  const monthly = await fb.getSalesReport(30);
+
+  let msg = `📊 *Sales Report*\n\n`;
+  msg += `*Last 7 days:*\n💰 ₹${weekly.totalSales} — ${weekly.orderCount} orders\n`;
+  if (weekly.topProducts.length) msg += `Top: ${weekly.topProducts.join(', ')}\n`;
+  msg += `\n*Last 30 days:*\n💰 ₹${monthly.totalSales} — ${monthly.orderCount} orders\n`;
+  if (monthly.topProducts.length) msg += `Top: ${monthly.topProducts.join(', ')}\n`;
+
+  await ctx.reply(msg, { parse_mode: 'Markdown' });
+});
+
+bot.command('ban', async (ctx) => {
+  if (!fb.isAdmin(ctx.from.id)) return;
+  const parts = ctx.message.text.split(' ');
+  const targetId = parts[1];
+  const reason = parts.slice(2).join(' ');
+
+  if (!targetId) return ctx.reply('Usage: /ban <telegram_id> <reason>');
+
+  await fb.banUser(targetId, reason);
+  await ctx.reply(`🚫 User ${targetId} banned.`);
+});
+
+bot.command('unban', async (ctx) => {
+  if (!fb.isAdmin(ctx.from.id)) return;
+  const targetId = ctx.message.text.split(' ')[1];
+
+  if (!targetId) return ctx.reply('Usage: /unban <telegram_id>');
+
+  await fb.unbanUser(targetId);
+  await ctx.reply(`✅ User ${targetId} unbanned.`);
+});
+
+// Utility: send any file to bot to get its file_id (for product delivery setup)
+bot.on('document', async (ctx) => {
+  if (!fb.isAdmin(ctx.from.id)) return;
+  await ctx.reply(`📎 File ID:\n\`${ctx.message.document.file_id}\`\n\nAdmin panel mein product add karte waqt yeh paste karo.`, { parse_mode: 'Markdown' });
+});
+
+// ============ TEXT HANDLER (for multi-step states) ============
+
+bot.on('text', async (ctx) => {
+  const state = userState[ctx.from.id];
+  if (!state) return; // ignore, no active flow
+
+  if (state.step === 'awaiting_search_query') {
+    delete userState[ctx.from.id];
+    const query = ctx.message.text.trim();
+    const results = await fb.searchProducts(query);
+    const ids = Object.keys(results);
+
+    if (ids.length === 0) {
+      return ctx.reply(`Koi product "${query}" naam se nahi mila. 🔍`);
+    }
+
+    await ctx.reply(`🔍 ${ids.length} result(s) mile:`);
+    for (const id of ids) {
+      await sendProductCard(ctx, id, results[id]);
+    }
+    return;
+  }
+
+  if (state.step === 'awaiting_review_comment') {
+    delete userState[ctx.from.id];
+    const { productId, rating } = state.data;
+    const comment = ctx.message.text.trim().toLowerCase() === 'skip' ? '' : ctx.message.text.trim();
+
+    await fb.addReview(productId, ctx.from.id, ctx.from.first_name, rating, comment);
+    return ctx.reply('✅ Review submit ho gaya, thank you! 🙏');
+  }
+
+  if (state.step === 'awaiting_coupon_code') {
+    delete userState[ctx.from.id];
+    const { productId } = state.data;
+    const code = ctx.message.text.trim().toUpperCase();
+    const product = await fb.getProduct(productId);
+
+    if (!product) return ctx.reply('Product not found.');
+
+    const check = await fb.validateCoupon(code, product.price);
+    if (!check.valid) {
+      await ctx.reply(`❌ ${check.reason}`);
+      return showOrderSummary(ctx, productId, product, null);
+    }
+
+    await ctx.reply(`✅ Coupon applied! Discount: ₹${check.discount}`);
+    return showOrderSummary(ctx, productId, product, { code, discount: check.discount });
+  }
+
+  if (state.step === 'awaiting_refund_reason') {
+    delete userState[ctx.from.id];
+    const { orderId } = state.data;
+    const reason = ctx.message.text.trim();
+
+    await fb.requestRefund(orderId, reason);
+    await ctx.reply('✅ Refund request bhej diya gaya. Admin review karega jaldi.');
+
+    const adminIds = (process.env.ADMIN_TELEGRAM_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+    for (const adminId of adminIds) {
+      try {
+        await bot.telegram.sendMessage(adminId, `↩️ *Refund Request*\n\nOrder: ${orderId}\nReason: ${reason}\n\nApprove/reject from admin panel.`, { parse_mode: 'Markdown' });
+      } catch (e) {}
+    }
+    return;
+  }
+
+  if (state.step === 'awaiting_addmoney_amount') {
+    const amount = parseInt(ctx.message.text.trim());
+
+    if (isNaN(amount) || amount < 10) {
+      return ctx.reply('❌ Valid amount daalo (minimum ₹10).');
+    }
+
+    delete userState[ctx.from.id];
+
+    const order = await fb.createOrder({
+      userId: String(ctx.from.id),
+      productId: 'WALLET_TOPUP',
+      productName: 'Wallet Top-up',
+      amount,
+      paymentMethod: 'zabupi'
+    });
+
+    const payment = await zabupi.createPaymentOrder({
+      orderId: order.id,
+      amount,
+      userId: ctx.from.id,
+      userName: ctx.from.first_name,
+      purpose: 'Wallet Top-up'
+    });
+
+    if (!payment.success) {
+      await fb.updateOrderStatus(order.id, 'failed');
+      return ctx.reply('❌ Payment link generate nahi ho paya. Try again.');
+    }
+
+    await fb.updateOrderStatus(order.id, 'pending', { zabupiTxnId: payment.transactionId, isWalletTopup: true });
+
+    await ctx.reply(
+      `💳 Add ₹${amount} to wallet`,
+      Markup.inlineKeyboard([[Markup.button.url('💳 Pay Now', payment.paymentUrl)]])
+    );
+  }
+});
+
+// ============ ADMIN API — Bot Profile Management ============
+// Protected by ADMIN_API_SECRET (set in Railway env vars). admin.html calls
+// these endpoints to change bot name/description/photo since the Telegram
+// Bot API requires the bot token, which must never be exposed to the browser.
+
+function checkAdminApiSecret(req, res) {
+  const secret = req.headers['x-admin-secret'];
+  if (!secret || secret !== process.env.ADMIN_API_SECRET) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return false;
+  }
+  return true;
+}
+
+app.post('/admin-api/set-bot-name', async (req, res) => {
+  if (!checkAdminApiSecret(req, res)) return;
+  try {
+    const { name } = req.body;
+    await bot.telegram.setMyName(name);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('setMyName failed:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/admin-api/set-bot-description', async (req, res) => {
+  if (!checkAdminApiSecret(req, res)) return;
+  try {
+    const { description, shortDescription } = req.body;
+    if (description) await bot.telegram.setMyDescription(description);
+    if (shortDescription) await bot.telegram.setMyShortDescription(shortDescription);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('setMyDescription failed:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// NOTE: Telegram's Bot API has no method for a bot to change its own profile
+// photo — that can only be done manually via @BotFather (/setuserpic).
+// This endpoint is intentionally not implemented; admin.html shows a direct
+// link to BotFather instead of a broken button.
+
+// ============ ZABUPI (ZapUPI) WEBHOOK (Express server) ============
+
+app.post('/webhook/zabupi', async (req, res) => {
+  try {
+    const payload = req.body;
+
+    // ZapUPI's webhook payload field names — confirm exact shape against a real
+    // webhook hit once live; this follows their create-order response naming.
+    const order_id = payload.order_id;
+
+    if (!order_id) {
+      console.warn('⚠️ Webhook missing order_id', payload);
+      return res.status(400).send('Missing order_id');
+    }
+
+    const order = await fb.getOrder(order_id);
+    if (!order) return res.status(404).send('Order not found');
+    if (order.status === 'delivered' || order.status === 'paid') {
+      return res.status(200).send('Already processed'); // idempotency
+    }
+
+    // No confirmed webhook signature scheme for ZapUPI — re-verify by polling
+    // their order-status endpoint directly rather than trusting the webhook body.
+    const statusCheck = await zabupi.checkPaymentStatus(order_id);
+    const isPaid = statusCheck && (statusCheck.status === 'success' || statusCheck.status === 'paid' || statusCheck.txn_status === 'success');
+
+    if (!isPaid) {
+      await fb.updateOrderStatus(order_id, 'failed');
+      return res.status(200).send('OK');
+    }
+
+    const transaction_id = statusCheck.txn_id || payload.txn_id || null;
+    await fb.updateOrderStatus(order_id, 'paid', { zabupiTxnId: transaction_id });
+
+    // Handle wallet top-up
+    if (order.productId === 'WALLET_TOPUP' || order.isWalletTopup) {
+      await fb.creditWallet(order.userId, order.amount, 'topup');
+      await bot.telegram.sendMessage(order.userId, `✅ ₹${order.amount} added to your wallet!`);
+      await fb.updateOrderStatus(order_id, 'delivered', { deliveredAt: Date.now() });
+      return res.status(200).send('OK');
+    }
+
+    // Handle Pro Plan subscription
+    if (order.productId === 'PRO_PLAN' || order.isProPlan) {
+      const duration = order.proPlanDuration || 30;
+      const newExpiry = await fb.activateProPlan(order.userId, duration);
+      await bot.telegram.sendMessage(
+        order.userId,
+        `👑 *Pro Plan Activated!*\n\nAap ab VIP hain — sab paid products FREE mein download kar sakte ho.\n\nExpires: ${new Date(newExpiry).toLocaleDateString()}`,
+        { parse_mode: 'Markdown' }
+      );
+      await fb.updateOrderStatus(order_id, 'delivered', { deliveredAt: Date.now() });
+      return res.status(200).send('OK');
+    }
+
+    // Handle product purchase
+    const product = await fb.getProduct(order.productId);
+    await fb.processReferralBonus(order.userId, order.amount);
+    if (order.couponUsed) await fb.incrementCouponUsage(order.couponUsed);
+    await fb.decrementStock(order.productId);
+    await checkAndAlertLowStock(order.productId);
+
+    if (product) {
+      try {
+        if (product.deliveryType === 'file' && product.fileId) {
+          await bot.telegram.sendDocument(order.userId, product.fileId, {
+            caption: `📦 ${product.name}\n\nThank you for your purchase! 🙏`
+          });
+        } else if (product.deliveryType === 'link' && product.deliveryLink) {
+          await bot.telegram.sendMessage(
+            order.userId,
+            `✅ Payment successful!\n\n📦 *${product.name}*\n\n🔗 Download Link:\n${product.deliveryLink}\n\nThank you! 🙏`,
+            { parse_mode: 'Markdown' }
+          );
+        }
+        await fb.updateOrderStatus(order_id, 'delivered', { deliveredAt: Date.now() });
+      } catch (deliveryErr) {
+        console.error('Webhook delivery error:', deliveryErr);
+      }
+    }
+
+    res.status(200).send('OK');
+  } catch (err) {
+    console.error('Webhook error:', err);
+    res.status(500).send('Error');
+  }
+});
+
+app.get('/payment-success', (req, res) => {
+  res.send('<h2>Payment received! You can return to Telegram now. ✅</h2>');
+});
+
+app.get('/payment-failed', (req, res) => {
+  res.send('<h2>Payment failed. Please return to Telegram and try again. ❌</h2>');
+});
+
+app.get('/payment-timeout', (req, res) => {
+  res.send('<h2>Payment timed out. Please return to Telegram and try again. ⏱️</h2>');
+});
+
+app.get('/', (req, res) => res.send('Bot server running ✅'));
+
+// ============ BROADCAST LISTENER ============
+// Admin panel writes to broadcastQueue/{id} with { message, sent:false }
+// This listens in real-time and sends to all users, then marks sent:true
+
+fb.db.ref('broadcastQueue').on('child_added', async (snap) => {
+  const data = snap.val();
+  if (!data || data.sent) return;
+
+  const users = await fb.getAllUsers();
+  const userIds = Object.keys(users);
+
+  let successCount = 0;
+  for (const uid of userIds) {
+    try {
+      await bot.telegram.sendMessage(uid, `📢 *Announcement*\n\n${data.message}`, { parse_mode: 'Markdown' });
+      successCount++;
+    } catch (e) {
+      // user may have blocked the bot — skip silently
+    }
+    await new Promise(r => setTimeout(r, 50)); // avoid hitting Telegram rate limits
+  }
+
+  await snap.ref.update({ sent: true, sentAt: Date.now(), sentCount: successCount });
+  console.log(`📢 Broadcast sent to ${successCount}/${userIds.length} users`);
+});
+
+// ============ START SERVERS ============
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🌐 Webhook server running on port ${PORT}`));
+
+bot.launch().then(() => console.log('🤖 Bot started successfully'));
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
