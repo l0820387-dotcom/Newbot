@@ -12,9 +12,10 @@ app.use(express.json());
 const userState = {}; // { telegramId: { step, data } }
 
 // ============ EDIT-IN-PLACE NAVIGATION ============
-// Instead of sending a new message for every menu tap (which floods the chat),
-// we edit the previous bot message when possible. Falls back to a fresh
-// message on text input, new photos, or if editing fails (e.g. message too old).
+// We edit the previous bot message when possible so the chat stays clean.
+// editMessageText fails on photo/media-group messages (Telegram limitation) —
+// in that case we delete the old message and send a fresh one instead of
+// leaving a stray photo behind, which is what caused the "jumpy" feel.
 
 async function smartReply(ctx, text, extra = {}) {
   const payload = { parse_mode: 'Markdown', ...extra };
@@ -24,12 +25,41 @@ async function smartReply(ctx, text, extra = {}) {
       await ctx.editMessageText(text, payload);
       return;
     } catch (err) {
-      // Original message might be a photo/media-group (can't editMessageText on those),
-      // or too old to edit — fall back to sending fresh.
+      // Can't edit (likely a photo message) — clean up instead of stacking messages
+      try { await ctx.deleteMessage(); } catch (e) { /* delete also failed, fine — we still send below */ }
     }
   }
 
+  // Always guaranteed to run if edit wasn't possible, regardless of delete outcome
   await ctx.reply(text, payload);
+}
+
+// ---- Navigation stack: tracks which screen to return to on "Back" ----
+// Stored per-user in memory. Each screen push is just an action name string
+// (e.g. 'menu_profile', 'cat_Bots') that we can re-trigger to go back.
+const navStack = {}; // { telegramId: ['menu_home', 'menu_browse', 'cat_Bots'] }
+
+function pushNav(telegramId, screen) {
+  if (!navStack[telegramId]) navStack[telegramId] = [];
+  const stack = navStack[telegramId];
+  if (stack[stack.length - 1] !== screen) stack.push(screen);
+  if (stack.length > 15) stack.shift(); // cap memory use per user
+}
+
+function popNav(telegramId) {
+  const stack = navStack[telegramId];
+  if (!stack || stack.length <= 1) return 'menu_home';
+  stack.pop(); // remove current screen
+  return stack[stack.length - 1] || 'menu_home';
+}
+
+function navButtons(extraRows, telegramId) {
+  const stack = navStack[telegramId];
+  const canGoBack = stack && stack.length > 1;
+  const row = canGoBack
+    ? [Markup.button.callback('⬅️ Back', 'nav_back'), Markup.button.callback('🏠 Home', 'menu_home')]
+    : [Markup.button.callback('🏠 Home', 'menu_home')];
+  return Markup.inlineKeyboard(extraRows ? [...extraRows, row] : [row]);
 }
 
 // ============ BAN CHECK MIDDLEWARE ============
@@ -167,6 +197,7 @@ function mainMenu() {
 
 bot.action('menu_home', async (ctx) => {
   await ctx.answerCbQuery();
+  navStack[ctx.from.id] = ['menu_home']; // reset stack — Home always starts fresh
   await sendMainMenu(ctx);
 });
 
@@ -174,6 +205,11 @@ bot.action('menu_home', async (ctx) => {
 
 bot.action('menu_profile', async (ctx) => {
   await ctx.answerCbQuery();
+  pushNav(ctx.from.id, 'menu_profile');
+  await renderProfile(ctx);
+});
+
+async function renderProfile(ctx) {
   const telegramId = ctx.from.id;
   const user = await fb.getUser(telegramId);
   const balance = await fb.getWalletBalance(telegramId);
@@ -184,19 +220,61 @@ bot.action('menu_profile', async (ctx) => {
 
   const vipLine = isVip ? `👑 VIP Active — ${vipDays} days left` : '👤 Free User';
 
-  const msg = `👤 *My Profile*\n\nName: ${user.name}\nUsername: ${user.username ? '@' + user.username : '-'}\nTelegram ID: \`${telegramId}\`\n\n${vipLine}\n💰 Wallet: ₹${balance}\n📦 Total Orders: ${orderCount}\n🔗 Referral Code: ${user.referralCode}`;
+  const msg = `👤 *My Profile*\n\n✨ Name: ${user.name}\n🔖 Username: ${user.username ? '@' + user.username : '-'}\n🆔 Telegram ID: \`${telegramId}\`\n\n${vipLine}\n💰 Wallet: ₹${balance}\n📦 Total Orders: ${orderCount}\n🔗 Referral Code: \`${user.referralCode}\``;
 
-  await smartReply(ctx, msg, backButton());
-});
-
-function backButton() {
-  return Markup.inlineKeyboard([[Markup.button.callback('🏠 Home', 'menu_home')]]);
+  await smartReply(ctx, msg, backButton(ctx));
 }
+
+function backButton(ctx) {
+  const telegramId = ctx?.from?.id;
+  const stack = telegramId ? navStack[telegramId] : null;
+  const canGoBack = stack && stack.length > 1;
+
+  const row = canGoBack
+    ? [Markup.button.callback('⬅️ Back', 'nav_back'), Markup.button.callback('🏠 Home', 'menu_home')]
+    : [Markup.button.callback('🏠 Home', 'menu_home')];
+
+  return Markup.inlineKeyboard([row]);
+}
+
+// Generic handler: pops the nav stack and shows the previous screen directly.
+// We call the underlying screen-render functions directly (not re-dispatching
+// fake Telegram events, which is fragile) — so Back only supports screens with
+// a simple, no-argument render function. Anything else falls back to Home.
+bot.action('nav_back', async (ctx) => {
+  await ctx.answerCbQuery();
+  const telegramId = ctx.from.id;
+  const target = popNav(telegramId);
+
+  const screenRenderers = {
+    menu_home: () => sendMainMenu(ctx),
+    menu_profile: () => renderProfile(ctx),
+    menu_browse: () => showCategories(ctx),
+    menu_free: () => renderFreeProducts(ctx),
+    menu_proplan: () => renderProPlan(ctx),
+    menu_purchases: () => renderPurchases(ctx),
+    menu_orders: () => renderOrderStatus(ctx),
+    menu_referrals: () => sendReferralInfo(ctx),
+    menu_stats: () => renderStats(ctx),
+    menu_paymenthistory: () => renderPaymentHistory(ctx),
+    menu_support: () => renderSupport(ctx),
+    menu_language: () => renderLanguage(ctx)
+  };
+
+  const renderer = screenRenderers[target];
+  if (renderer) return renderer();
+  return sendMainMenu(ctx);
+});
 
 // ============ PRO PLAN ============
 
 bot.action('menu_proplan', async (ctx) => {
   await ctx.answerCbQuery();
+  pushNav(ctx.from.id, 'menu_proplan');
+  await renderProPlan(ctx);
+});
+
+async function renderProPlan(ctx) {
   const telegramId = ctx.from.id;
   const settings = await fb.getProPlanSettings();
   const isVip = await fb.isUserVip(telegramId);
@@ -205,21 +283,15 @@ bot.action('menu_proplan', async (ctx) => {
     const daysLeft = await fb.getVipDaysLeft(telegramId);
     return smartReply(
       ctx,
-      `👑 *You're already VIP!*\n\n${daysLeft} days remaining.\n\nWant to extend? Buy again to add more days.`,
-      Markup.inlineKeyboard([
-        [Markup.button.callback(`💳 Extend — ₹${settings.price}`, 'buyproplan')],
-        [Markup.button.callback('🏠 Home', 'menu_home')]
-      ])
+      `👑 *You're already VIP!*\n\n✨ ${daysLeft} days remaining.\n\nWant to extend? Buy again to add more days.`,
+      navButtons([[Markup.button.callback(`💳 Extend — ₹${settings.price}`, 'buyproplan')]], telegramId)
     );
   }
 
   const msg = `👑 *Upgrade to VIP*\n\n💰 ₹${settings.price} · ${settings.description}\n\n✨ *What you unlock:*\n✅ ${settings.durationDays} din unlimited downloads\n✅ Koi bhi paid product FREE\n✅ Wallet balance ki zarurat nahi\n✅ Naye products bhi free\n\n🛡 Secure UPI payment · Instant activation`;
 
-  await smartReply(ctx, msg, Markup.inlineKeyboard([
-    [Markup.button.callback(`💳 Upgrade Now — ₹${settings.price}`, 'buyproplan')],
-    [Markup.button.callback('🏠 Home', 'menu_home')]
-  ]));
-});
+  await smartReply(ctx, msg, navButtons([[Markup.button.callback(`💳 Upgrade Now — ₹${settings.price}`, 'buyproplan')]], telegramId));
+}
 
 bot.action('buyproplan', async (ctx) => {
   await ctx.answerCbQuery('Generating payment link...');
@@ -261,34 +333,45 @@ bot.action('buyproplan', async (ctx) => {
 
 bot.action('menu_free', async (ctx) => {
   await ctx.answerCbQuery();
+  pushNav(ctx.from.id, 'menu_free');
+  await renderFreeProducts(ctx);
+});
+
+async function renderFreeProducts(ctx) {
+  const telegramId = ctx.from.id;
   const all = await fb.getAllProducts(true);
   const freeEntries = Object.entries(all).filter(([id, p]) => p.price === 0);
 
   if (freeEntries.length === 0) {
-    return smartReply(ctx, '🎁 Abhi koi free product available nahi hai. Jaldi aayega! 🙏', backButton());
+    return smartReply(ctx, '🎁 Abhi koi free product available nahi hai. Jaldi aayega! 🙏', backButton(ctx));
   }
 
-  const buttons = freeEntries.map(([id, p]) => [Markup.button.callback(`🛒 ${p.name} | FREE`, `viewproduct_${id}`)]);
-  buttons.push([Markup.button.callback('🏠 Home', 'menu_home')]);
+  const buttons = freeEntries.map(([id, p]) => [Markup.button.callback(`🎁 ${p.name} | FREE`, `viewproduct_${id}`)]);
 
-  await smartReply(ctx, '🎁 *Free Products*\n\nTap any product to view full details.', Markup.inlineKeyboard(buttons));
-});
+  await smartReply(ctx, '🎁 *Free Products*\n\n✨ Tap any product to view full details.', navButtons(buttons, telegramId));
+}
 
 // ============ ORDER STATUS ============
 
 bot.action('menu_orders', async (ctx) => {
   await ctx.answerCbQuery();
-  const orders = await fb.getUserOrders(ctx.from.id);
+  pushNav(ctx.from.id, 'menu_orders');
+  await renderOrderStatus(ctx);
+});
+
+async function renderOrderStatus(ctx) {
+  const telegramId = ctx.from.id;
+  const orders = await fb.getUserOrders(telegramId);
   const list = Object.values(orders).sort((a, b) => b.createdAt - a.createdAt);
 
   if (list.length === 0) {
-    return smartReply(ctx, '📋 Abhi tak koi order nahi hai.', backButton());
+    return smartReply(ctx, '📋 Abhi tak koi order nahi hai.', backButton(ctx));
   }
 
   let msg = '📋 *Order Status*\n\n';
   list.slice(0, 10).forEach(o => {
     const statusEmoji = o.status === 'delivered' ? '✅' : o.status === 'pending' ? '⏳' : o.status === 'failed' ? '❌' : o.status === 'refunded' ? '↩️' : '🔄';
-    msg += `${statusEmoji} ${o.productName} — ₹${o.amount} (${o.status})\n`;
+    msg += `${statusEmoji} ${o.productName} — ₹${o.amount} _(${o.status})_\n`;
   });
 
   const refundable = list.find(o => o.status === 'delivered' && !o.refundStatus && o.productId !== 'PRO_PLAN' && o.productId !== 'WALLET_TOPUP');
@@ -296,15 +379,19 @@ bot.action('menu_orders', async (ctx) => {
   if (refundable) {
     buttons.push([Markup.button.callback('↩️ Request Refund', `refund_${refundable.id}`)]);
   }
-  buttons.push([Markup.button.callback('🏠 Home', 'menu_home')]);
 
-  await smartReply(ctx, msg, Markup.inlineKeyboard(buttons));
-});
+  await smartReply(ctx, msg, navButtons(buttons, telegramId));
+}
 
 // ============ MY STATS ============
 
 bot.action('menu_stats', async (ctx) => {
   await ctx.answerCbQuery();
+  pushNav(ctx.from.id, 'menu_stats');
+  await renderStats(ctx);
+});
+
+async function renderStats(ctx) {
   const telegramId = ctx.from.id;
   const orders = await fb.getUserOrders(telegramId);
   const list = Object.values(orders);
@@ -312,15 +399,20 @@ bot.action('menu_stats', async (ctx) => {
   const totalSpent = paidOrders.reduce((sum, o) => sum + (o.amount || 0), 0);
   const user = await fb.getUser(telegramId);
 
-  const msg = `📊 *My Stats*\n\n🛒 Total Orders: ${list.length}\n✅ Completed: ${paidOrders.length}\n💰 Total Spent: ₹${totalSpent}\n📅 Member since: ${new Date(user.joinedAt).toLocaleDateString()}`;
+  const msg = `📊 *My Stats*\n\n🛒 Total Orders: *${list.length}*\n✅ Completed: *${paidOrders.length}*\n💰 Total Spent: *₹${totalSpent}*\n📅 Member since: ${new Date(user.joinedAt).toLocaleDateString()}`;
 
-  await smartReply(ctx, msg, backButton());
-});
+  await smartReply(ctx, msg, backButton(ctx));
+}
 
 // ============ PAYMENT HISTORY ============
 
 bot.action('menu_paymenthistory', async (ctx) => {
   await ctx.answerCbQuery();
+  pushNav(ctx.from.id, 'menu_paymenthistory');
+  await renderPaymentHistory(ctx);
+});
+
+async function renderPaymentHistory(ctx) {
   const txns = await new Promise((resolve) => {
     fb.db.ref('walletTransactions').orderByChild('userId').equalTo(String(ctx.from.id)).once('value', snap => {
       resolve(snap.exists() ? Object.values(snap.val()) : []);
@@ -328,32 +420,43 @@ bot.action('menu_paymenthistory', async (ctx) => {
   });
 
   if (txns.length === 0) {
-    return smartReply(ctx, '🧾 Koi payment history nahi mili.', backButton());
+    return smartReply(ctx, '🧾 Koi payment history nahi mili.', backButton(ctx));
   }
 
   let msg = '🧾 *Payment History*\n\n';
   txns.sort((a, b) => b.createdAt - a.createdAt).slice(0, 10).forEach(t => {
     const emoji = t.type === 'credit' ? '➕' : '➖';
-    msg += `${emoji} ₹${t.amount} — ${t.reason} (${new Date(t.createdAt).toLocaleDateString()})\n`;
+    msg += `${emoji} ₹${t.amount} — ${t.reason} _(${new Date(t.createdAt).toLocaleDateString()})_\n`;
   });
 
-  await smartReply(ctx, msg, backButton());
-});
+  await smartReply(ctx, msg, backButton(ctx));
+}
 
 // ============ LANGUAGE ============
 
 bot.action('menu_language', async (ctx) => {
   await ctx.answerCbQuery();
-  await smartReply(ctx, '🌐 Abhi sirf Hinglish support hai. Full Hindi/English switch jaldi aa raha hai! 🙏', backButton());
+  pushNav(ctx.from.id, 'menu_language');
+  await renderLanguage(ctx);
 });
+
+async function renderLanguage(ctx) {
+  await smartReply(ctx, '🌐 Abhi sirf Hinglish support hai.\n\n✨ Full Hindi/English switch jaldi aa raha hai! 🙏', backButton(ctx));
+}
 
 // ============ SUPPORT (menu action version) ============
 
 bot.action('menu_support', async (ctx) => {
   await ctx.answerCbQuery();
+  pushNav(ctx.from.id, 'menu_support');
+  await renderSupport(ctx);
+});
+
+async function renderSupport(ctx) {
+  const telegramId = ctx.from.id;
   const settings = await fb.getBotSettings();
 
-  let msg = `📞 *Customer Support*\n\nKoi bhi issue ho, humse contact karo:\n\n`;
+  let msg = `📞 *Customer Support*\n\n💫 Koi bhi issue ho, humse contact karo:\n\n`;
   const buttons = [];
 
   if (settings.supportTelegram) {
@@ -370,38 +473,44 @@ bot.action('menu_support', async (ctx) => {
     msg += 'Support details jaldi update honge.';
   }
 
-  buttons.push([Markup.button.callback('🏠 Home', 'menu_home')]);
-  await smartReply(ctx, msg, Markup.inlineKeyboard(buttons));
-});
+  await smartReply(ctx, msg, navButtons(buttons, telegramId));
+}
 
 // ============ MY PURCHASES ============
 
 bot.action('menu_purchases', async (ctx) => {
   await ctx.answerCbQuery();
-  const orders = await fb.getUserOrders(ctx.from.id);
+  pushNav(ctx.from.id, 'menu_purchases');
+  await renderPurchases(ctx);
+});
+
+async function renderPurchases(ctx) {
+  const telegramId = ctx.from.id;
+  const orders = await fb.getUserOrders(telegramId);
   const delivered = Object.values(orders).filter(o => o.status === 'delivered').sort((a, b) => b.createdAt - a.createdAt);
 
   if (delivered.length === 0) {
-    return smartReply(ctx, '📦 Abhi tak koi purchase nahi hai.', backButton());
+    return smartReply(ctx, '📦 Abhi tak koi purchase nahi hai.', backButton(ctx));
   }
 
   const buttons = delivered.slice(0, 15)
     .filter(o => o.productId && o.productId !== 'PRO_PLAN' && o.productId !== 'WALLET_TOPUP')
     .map(o => [Markup.button.callback(`✅ ${o.productName} — ₹${o.amount}`, `viewproduct_${o.productId}`)]);
-  buttons.push([Markup.button.callback('🏠 Home', 'menu_home')]);
 
-  await smartReply(ctx, '📦 *My Purchases*\n\nTap to view or re-download:', Markup.inlineKeyboard(buttons));
-});
+  await smartReply(ctx, '📦 *My Purchases*\n\n✨ Tap to view or re-download:', navButtons(buttons, telegramId));
+}
 
 // ============ MY REFERRALS (menu action version) ============
 
 bot.action('menu_referrals', async (ctx) => {
   await ctx.answerCbQuery();
+  pushNav(ctx.from.id, 'menu_referrals');
   await sendReferralInfo(ctx);
 });
 
 async function sendReferralInfo(ctx) {
-  const user = await fb.getUser(ctx.from.id);
+  const telegramId = ctx.from.id;
+  const user = await fb.getUser(telegramId);
   const settings = await fb.getReferralSettings();
   const botInfo = await bot.telegram.getMe();
 
@@ -412,8 +521,8 @@ async function sendReferralInfo(ctx) {
 
   await smartReply(
     ctx,
-    `🔗 *My Referrals*\n\nApne friends ko invite karo aur unki pehli purchase pe *${bonusText}* wallet bonus paao!\n\nYour referral link:\n${link}`,
-    backButton()
+    `🔗 *My Referrals*\n\n💎 Apne friends ko invite karo aur unki pehli purchase pe *${bonusText}* wallet bonus paao!\n\n🔗 Your referral link:\n\`${link}\``,
+    backButton(ctx)
   );
 }
 
@@ -421,15 +530,17 @@ async function sendReferralInfo(ctx) {
 
 bot.action('menu_browse', async (ctx) => {
   await ctx.answerCbQuery();
+  pushNav(ctx.from.id, 'menu_browse');
   await showCategories(ctx);
 });
 
 // ============ PRODUCTS / CATALOG (flat button list style) ============
 
 async function showCategories(ctx) {
+  const telegramId = ctx.from.id;
   const categories = await fb.getAllCategories();
   if (categories.length === 0) {
-    return smartReply(ctx, 'Abhi koi product available nahi hai. Jaldi aayega! 🙏', backButton());
+    return smartReply(ctx, '🛍 Abhi koi product available nahi hai. Jaldi aayega! 🙏', backButton(ctx));
   }
 
   const buttons = categories.map(cat => [Markup.button.callback(`📁 ${cat}`, `cat_${cat}`)]);
@@ -439,6 +550,7 @@ async function showCategories(ctx) {
 
 bot.action(/^cat_(.+)$/, async (ctx) => {
   const category = ctx.match[1];
+  const telegramId = ctx.from.id;
   const products = await fb.getProductsByCategory(category);
   const entries = Object.entries(products);
 
@@ -447,18 +559,17 @@ bot.action(/^cat_(.+)$/, async (ctx) => {
   }
 
   await ctx.answerCbQuery();
+  pushNav(telegramId, `cat_${category}`);
 
   const buttons = entries.map(([id, p]) => {
     const priceLabel = p.price === 0 ? 'FREE' : `₹${p.price}`;
     return [Markup.button.callback(`🛒 ${p.name} | ${priceLabel}`, `viewproduct_${id}`)];
   });
-  buttons.push([Markup.button.callback('⬅️ Categories', 'menu_browse')]);
-  buttons.push([Markup.button.callback('🏠 Home', 'menu_home')]);
 
   await smartReply(
     ctx,
-    `📁 *${category}*\n\nExplore our full catalogue below — tap any product to view full details.`,
-    Markup.inlineKeyboard(buttons)
+    `📁 *${category}*\n\n✨ Explore our full catalogue below — tap any product to view full details.`,
+    navButtons(buttons, telegramId)
   );
 });
 
@@ -473,22 +584,31 @@ bot.action(/^viewproduct_(.+)$/, async (ctx) => {
 
   await ctx.answerCbQuery();
   await fb.incrementProductViews(productId);
+  pushNav(ctx.from.id, `viewproduct_${productId}`);
   await sendProductCard(ctx, productId, product);
 });
 
 // ---- Reusable product card sender (used by category browse + search) ----
 async function sendProductCard(ctx, id, p) {
+  const telegramId = ctx.from.id;
   const { avg, count } = await fb.getProductAvgRating(id);
-  const ratingLine = count > 0 ? `\n⭐ ${avg}/5 (${count} reviews)` : '';
+  const ratingLine = count > 0 ? `\n⭐ ${avg}/5 _(${count} reviews)_` : '';
   const stockLine = (p.stock !== undefined && p.stock !== -1) ? `\n📦 Stock: ${p.stock}` : '';
   const viewsLine = p.views ? `\n👁 ${p.views} views` : '';
+  const priceLabel = p.price === 0 ? '*FREE* 🎁' : `*₹${p.price}*`;
 
-  const caption = `*${p.name}*\n\n${p.description || ''}\n\n💰 Price: ₹${p.price}${ratingLine}${stockLine}${viewsLine}`;
-  const buttons = Markup.inlineKeyboard([
+  const caption = `✨ *${p.name}*\n\n${p.description || ''}\n\n💰 Price: ${priceLabel}${ratingLine}${stockLine}${viewsLine}`;
+
+  const rows = [
     [Markup.button.callback('🛒 Buy Now', `buy_${id}`)],
-    [Markup.button.callback('⭐ Reviews', `reviews_${id}`)],
-    [Markup.button.callback('🏠 Home', 'menu_home')]
-  ]);
+    [Markup.button.callback('⭐ Reviews', `reviews_${id}`)]
+  ];
+  // Admin-configured custom button (e.g. "Join Community", "Watch Tutorial")
+  if (p.customButtonText && p.customButtonUrl) {
+    rows.push([Markup.button.url(`🔗 ${p.customButtonText}`, p.customButtonUrl)]);
+  }
+
+  const buttons = navButtons(rows, telegramId);
 
   // Support multiple images (imageUrls array) or fallback to single imageUrl
   const images = Array.isArray(p.imageUrls) && p.imageUrls.length > 0 ? p.imageUrls : (p.imageUrl ? [p.imageUrl] : []);

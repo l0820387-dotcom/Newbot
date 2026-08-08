@@ -429,7 +429,7 @@ async function getVipDaysLeft(telegramId) {
 async function getBotSettings() {
   const snap = await db.ref('botSettings').once('value');
   return snap.exists() ? snap.val() : {
-    welcomeMessage: '👋 Welcome {name}!\n\nQuality you can count on, delivery you can rely on.\n\n🛍 Curated Products — paid & free\n💳 Secure Payments via UPI\n⚡ Instant Delivery after payment\n🛡 Dedicated Support, whenever you need it\n\n👇 Select an option below to begin',
+    welcomeMessage: '✨ *Welcome, {name}!* ✨\n\n💎 Quality you can count on, delivery you can rely on.\n\n🛍 *Curated Products* — paid & free\n💳 *Secure Payments* via UPI\n⚡ *Instant Delivery* after payment\n🛡 *Dedicated Support*, whenever you need it\n\n👇 Select an option below to begin',
     channels: [],           // array of { username, required }
     supportTelegram: '',
     supportWhatsapp: '',
