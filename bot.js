@@ -11,6 +11,27 @@ app.use(express.json());
 // In-memory temp state (for multi-step flows like "buy via wallet confirm")
 const userState = {}; // { telegramId: { step, data } }
 
+// ============ EDIT-IN-PLACE NAVIGATION ============
+// Instead of sending a new message for every menu tap (which floods the chat),
+// we edit the previous bot message when possible. Falls back to a fresh
+// message on text input, new photos, or if editing fails (e.g. message too old).
+
+async function smartReply(ctx, text, extra = {}) {
+  const payload = { parse_mode: 'Markdown', ...extra };
+
+  if (ctx.callbackQuery) {
+    try {
+      await ctx.editMessageText(text, payload);
+      return;
+    } catch (err) {
+      // Original message might be a photo/media-group (can't editMessageText on those),
+      // or too old to edit — fall back to sending fresh.
+    }
+  }
+
+  await ctx.reply(text, payload);
+}
+
 // ============ BAN CHECK MIDDLEWARE ============
 
 bot.use(async (ctx, next) => {
@@ -22,8 +43,28 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
-// ============ MANDATORY CHANNEL JOIN MIDDLEWARE ============
-// Blocks all bot interaction until user joins the configured channel.
+// ============ MAINTENANCE MODE MIDDLEWARE ============
+
+bot.use(async (ctx, next) => {
+  if (!ctx.from) return next();
+
+  const settings = await fb.getBotSettings();
+  if (!settings.maintenanceMode) return next();
+
+  // Admins bypass maintenance mode so they can still manage the bot
+  if (fb.isAdmin(ctx.from.id)) return next();
+
+  const msg = settings.maintenanceMessage || '🛠 Bot abhi maintenance mein hai. Thodi der baad try karo.';
+  if (ctx.callbackQuery) {
+    await ctx.answerCbQuery(msg, { show_alert: true });
+  } else {
+    await ctx.reply(msg);
+  }
+  return; // block everything else
+});
+
+// ============ MANDATORY CHANNEL JOIN MIDDLEWARE (supports multiple channels) ============
+// Blocks all bot interaction until user joins every required channel.
 // Skips the check itself for the "check_joined" button so users can retry.
 
 bot.use(async (ctx, next) => {
@@ -33,11 +74,12 @@ bot.use(async (ctx, next) => {
   if (ctx.callbackQuery && ctx.callbackQuery.data === 'check_joined') return next();
 
   const settings = await fb.getBotSettings();
-  if (!settings.channelRequired || !settings.channelUsername) return next();
+  const requiredChannels = (settings.channels || []).filter(c => c.required && c.username);
+  if (requiredChannels.length === 0) return next();
 
-  const isMember = await checkChannelMembership(ctx.from.id, settings.channelUsername);
-  if (!isMember) {
-    await sendJoinPrompt(ctx, settings.channelUsername);
+  const notJoined = await getUnjoinedChannels(ctx.from.id, requiredChannels);
+  if (notJoined.length > 0) {
+    await sendJoinPrompt(ctx, notJoined);
     return; // block everything else
   }
 
@@ -50,38 +92,47 @@ async function checkChannelMembership(telegramId, channelUsername) {
     const member = await bot.telegram.getChatMember(handle, telegramId);
     return ['member', 'administrator', 'creator'].includes(member.status);
   } catch (err) {
-    console.error('Channel membership check failed:', err.message);
+    console.error(`Channel membership check failed for ${channelUsername}:`, err.message);
     // If the bot isn't an admin in the channel or channel is misconfigured,
-    // fail open so the bot doesn't block everyone due to a config mistake.
+    // fail open for that channel so a config mistake doesn't block everyone.
     return true;
   }
 }
 
-async function sendJoinPrompt(ctx, channelUsername) {
-  const handle = channelUsername.startsWith('@') ? channelUsername.slice(1) : channelUsername;
+async function getUnjoinedChannels(telegramId, channels) {
+  const results = [];
+  for (const ch of channels) {
+    const isMember = await checkChannelMembership(telegramId, ch.username);
+    if (!isMember) results.push(ch);
+  }
+  return results;
+}
+
+async function sendJoinPrompt(ctx, channels) {
+  const buttons = channels.map(ch => {
+    const handle = ch.username.startsWith('@') ? ch.username.slice(1) : ch.username;
+    return [Markup.button.url(`📢 Join ${ch.label || handle}`, `https://t.me/${handle}`)];
+  });
+  buttons.push([Markup.button.callback('✅ I\'ve Joined All', 'check_joined')]);
+
   await ctx.reply(
-    `📢 *Ek chhota sa step baaki hai!*\n\nBot use karne se pehle humara channel join karo:`,
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [Markup.button.url('📢 Join Channel', `https://t.me/${handle}`)],
-        [Markup.button.callback('✅ I\'ve Joined', 'check_joined')]
-      ])
-    }
+    `📢 *Ek chhota sa step baaki hai!*\n\nBot use karne se pehle neeche diye channel(s) join karo:`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
   );
 }
 
 bot.action('check_joined', async (ctx) => {
   const settings = await fb.getBotSettings();
-  const isMember = await checkChannelMembership(ctx.from.id, settings.channelUsername);
+  const requiredChannels = (settings.channels || []).filter(c => c.required && c.username);
+  const notJoined = await getUnjoinedChannels(ctx.from.id, requiredChannels);
 
-  if (isMember) {
+  if (notJoined.length === 0) {
     await ctx.answerCbQuery('✅ Verified!');
     const telegramId = ctx.from.id;
     await fb.createUserIfNotExists(telegramId, ctx.from, null);
     await sendMainMenu(ctx);
   } else {
-    await ctx.answerCbQuery('❌ Abhi bhi join nahi kiya. Pehle channel join karo.', { show_alert: true });
+    await ctx.answerCbQuery('❌ Abhi bhi kuch channels join nahi kiye.', { show_alert: true });
   }
 });
 
@@ -99,7 +150,7 @@ async function sendMainMenu(ctx) {
   const settings = await fb.getBotSettings();
   const text = settings.welcomeMessage.replace('{name}', ctx.from.first_name);
 
-  await ctx.reply(text, { parse_mode: 'Markdown', ...mainMenu() });
+  await smartReply(ctx, text, mainMenu());
 }
 
 function mainMenu() {
@@ -135,7 +186,7 @@ bot.action('menu_profile', async (ctx) => {
 
   const msg = `👤 *My Profile*\n\nName: ${user.name}\nUsername: ${user.username ? '@' + user.username : '-'}\nTelegram ID: \`${telegramId}\`\n\n${vipLine}\n💰 Wallet: ₹${balance}\n📦 Total Orders: ${orderCount}\n🔗 Referral Code: ${user.referralCode}`;
 
-  await ctx.reply(msg, { parse_mode: 'Markdown', ...backButton() });
+  await smartReply(ctx, msg, backButton());
 });
 
 function backButton() {
@@ -152,24 +203,22 @@ bot.action('menu_proplan', async (ctx) => {
 
   if (isVip) {
     const daysLeft = await fb.getVipDaysLeft(telegramId);
-    return ctx.reply(
+    return smartReply(
+      ctx,
       `👑 *You're already VIP!*\n\n${daysLeft} days remaining.\n\nWant to extend? Buy again to add more days.`,
-      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
+      Markup.inlineKeyboard([
         [Markup.button.callback(`💳 Extend — ₹${settings.price}`, 'buyproplan')],
         [Markup.button.callback('🏠 Home', 'menu_home')]
-      ])}
+      ])
     );
   }
 
   const msg = `👑 *Upgrade to VIP*\n\n💰 ₹${settings.price} · ${settings.description}\n\n✨ *What you unlock:*\n✅ ${settings.durationDays} din unlimited downloads\n✅ Koi bhi paid product FREE\n✅ Wallet balance ki zarurat nahi\n✅ Naye products bhi free\n\n🛡 Secure UPI payment · Instant activation`;
 
-  await ctx.reply(msg, {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([
-      [Markup.button.callback(`💳 Upgrade Now — ₹${settings.price}`, 'buyproplan')],
-      [Markup.button.callback('🏠 Home', 'menu_home')]
-    ])
-  });
+  await smartReply(ctx, msg, Markup.inlineKeyboard([
+    [Markup.button.callback(`💳 Upgrade Now — ₹${settings.price}`, 'buyproplan')],
+    [Markup.button.callback('🏠 Home', 'menu_home')]
+  ]));
 });
 
 bot.action('buyproplan', async (ctx) => {
@@ -213,16 +262,16 @@ bot.action('buyproplan', async (ctx) => {
 bot.action('menu_free', async (ctx) => {
   await ctx.answerCbQuery();
   const all = await fb.getAllProducts(true);
-  const freeIds = Object.entries(all).filter(([id, p]) => p.price === 0).map(([id]) => id);
+  const freeEntries = Object.entries(all).filter(([id, p]) => p.price === 0);
 
-  if (freeIds.length === 0) {
-    return ctx.reply('Abhi koi free product available nahi hai. 🙏', backButton());
+  if (freeEntries.length === 0) {
+    return smartReply(ctx, '🎁 Abhi koi free product available nahi hai. Jaldi aayega! 🙏', backButton());
   }
 
-  for (const id of freeIds) {
-    await sendProductCard(ctx, id, all[id]);
-  }
-  await ctx.reply('👆 Free products', backButton());
+  const buttons = freeEntries.map(([id, p]) => [Markup.button.callback(`🛒 ${p.name} | FREE`, `viewproduct_${id}`)]);
+  buttons.push([Markup.button.callback('🏠 Home', 'menu_home')]);
+
+  await smartReply(ctx, '🎁 *Free Products*\n\nTap any product to view full details.', Markup.inlineKeyboard(buttons));
 });
 
 // ============ ORDER STATUS ============
@@ -233,7 +282,7 @@ bot.action('menu_orders', async (ctx) => {
   const list = Object.values(orders).sort((a, b) => b.createdAt - a.createdAt);
 
   if (list.length === 0) {
-    return ctx.reply('Abhi tak koi order nahi hai.', backButton());
+    return smartReply(ctx, '📋 Abhi tak koi order nahi hai.', backButton());
   }
 
   let msg = '📋 *Order Status*\n\n';
@@ -242,20 +291,14 @@ bot.action('menu_orders', async (ctx) => {
     msg += `${statusEmoji} ${o.productName} — ₹${o.amount} (${o.status})\n`;
   });
 
-  await ctx.reply(msg, { parse_mode: 'Markdown' });
-
   const refundable = list.find(o => o.status === 'delivered' && !o.refundStatus && o.productId !== 'PRO_PLAN' && o.productId !== 'WALLET_TOPUP');
+  const buttons = [];
   if (refundable) {
-    await ctx.reply(
-      `Order "${refundable.productName}" ke liye refund chahiye?`,
-      Markup.inlineKeyboard([
-        [Markup.button.callback('↩️ Request Refund', `refund_${refundable.id}`)],
-        [Markup.button.callback('🏠 Home', 'menu_home')]
-      ])
-    );
-  } else {
-    await ctx.reply('👆', backButton());
+    buttons.push([Markup.button.callback('↩️ Request Refund', `refund_${refundable.id}`)]);
   }
+  buttons.push([Markup.button.callback('🏠 Home', 'menu_home')]);
+
+  await smartReply(ctx, msg, Markup.inlineKeyboard(buttons));
 });
 
 // ============ MY STATS ============
@@ -271,7 +314,7 @@ bot.action('menu_stats', async (ctx) => {
 
   const msg = `📊 *My Stats*\n\n🛒 Total Orders: ${list.length}\n✅ Completed: ${paidOrders.length}\n💰 Total Spent: ₹${totalSpent}\n📅 Member since: ${new Date(user.joinedAt).toLocaleDateString()}`;
 
-  await ctx.reply(msg, { parse_mode: 'Markdown', ...backButton() });
+  await smartReply(ctx, msg, backButton());
 });
 
 // ============ PAYMENT HISTORY ============
@@ -285,7 +328,7 @@ bot.action('menu_paymenthistory', async (ctx) => {
   });
 
   if (txns.length === 0) {
-    return ctx.reply('Koi payment history nahi mili.', backButton());
+    return smartReply(ctx, '🧾 Koi payment history nahi mili.', backButton());
   }
 
   let msg = '🧾 *Payment History*\n\n';
@@ -294,14 +337,14 @@ bot.action('menu_paymenthistory', async (ctx) => {
     msg += `${emoji} ₹${t.amount} — ${t.reason} (${new Date(t.createdAt).toLocaleDateString()})\n`;
   });
 
-  await ctx.reply(msg, { parse_mode: 'Markdown', ...backButton() });
+  await smartReply(ctx, msg, backButton());
 });
 
 // ============ LANGUAGE ============
 
 bot.action('menu_language', async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.reply('🌐 Abhi sirf Hinglish support hai. Full Hindi/English switch jaldi aa raha hai! 🙏', backButton());
+  await smartReply(ctx, '🌐 Abhi sirf Hinglish support hai. Full Hindi/English switch jaldi aa raha hai! 🙏', backButton());
 });
 
 // ============ SUPPORT (menu action version) ============
@@ -328,7 +371,7 @@ bot.action('menu_support', async (ctx) => {
   }
 
   buttons.push([Markup.button.callback('🏠 Home', 'menu_home')]);
-  await ctx.reply(msg, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await smartReply(ctx, msg, Markup.inlineKeyboard(buttons));
 });
 
 // ============ MY PURCHASES ============
@@ -339,15 +382,15 @@ bot.action('menu_purchases', async (ctx) => {
   const delivered = Object.values(orders).filter(o => o.status === 'delivered').sort((a, b) => b.createdAt - a.createdAt);
 
   if (delivered.length === 0) {
-    return ctx.reply('Abhi tak koi purchase nahi hai.', backButton());
+    return smartReply(ctx, '📦 Abhi tak koi purchase nahi hai.', backButton());
   }
 
-  let msg = '📦 *My Purchases*\n\n';
-  delivered.slice(0, 10).forEach(o => {
-    msg += `✅ ${o.productName} — ₹${o.amount}\n`;
-  });
+  const buttons = delivered.slice(0, 15)
+    .filter(o => o.productId && o.productId !== 'PRO_PLAN' && o.productId !== 'WALLET_TOPUP')
+    .map(o => [Markup.button.callback(`✅ ${o.productName} — ₹${o.amount}`, `viewproduct_${o.productId}`)]);
+  buttons.push([Markup.button.callback('🏠 Home', 'menu_home')]);
 
-  await ctx.reply(msg, { parse_mode: 'Markdown', ...backButton() });
+  await smartReply(ctx, '📦 *My Purchases*\n\nTap to view or re-download:', Markup.inlineKeyboard(buttons));
 });
 
 // ============ MY REFERRALS (menu action version) ============
@@ -367,9 +410,10 @@ async function sendReferralInfo(ctx) {
     ? `${settings.bonusAmount}% of their first purchase`
     : `₹${settings.bonusAmount}`;
 
-  await ctx.reply(
+  await smartReply(
+    ctx,
     `🔗 *My Referrals*\n\nApne friends ko invite karo aur unki pehli purchase pe *${bonusText}* wallet bonus paao!\n\nYour referral link:\n${link}`,
-    { parse_mode: 'Markdown', ...backButton() }
+    backButton()
   );
 }
 
@@ -380,32 +424,56 @@ bot.action('menu_browse', async (ctx) => {
   await showCategories(ctx);
 });
 
-// ============ PRODUCTS / CATALOG ============
+// ============ PRODUCTS / CATALOG (flat button list style) ============
 
 async function showCategories(ctx) {
   const categories = await fb.getAllCategories();
   if (categories.length === 0) {
-    return ctx.reply('Abhi koi product available nahi hai. Jaldi aayega! 🙏', backButton());
+    return smartReply(ctx, 'Abhi koi product available nahi hai. Jaldi aayega! 🙏', backButton());
   }
 
   const buttons = categories.map(cat => [Markup.button.callback(`📁 ${cat}`, `cat_${cat}`)]);
   buttons.push([Markup.button.callback('🏠 Home', 'menu_home')]);
-  await ctx.reply('Category choose karo:', Markup.inlineKeyboard(buttons));
+  await smartReply(ctx, '🛍 *Browse Products*\n\nCategory choose karo:', Markup.inlineKeyboard(buttons));
 }
 
 bot.action(/^cat_(.+)$/, async (ctx) => {
   const category = ctx.match[1];
   const products = await fb.getProductsByCategory(category);
-  const ids = Object.keys(products);
+  const entries = Object.entries(products);
 
-  if (ids.length === 0) {
+  if (entries.length === 0) {
     return ctx.answerCbQuery('Is category mein abhi product nahi hai.');
   }
 
   await ctx.answerCbQuery();
-  for (const id of ids) {
-    await sendProductCard(ctx, id, products[id]);
+
+  const buttons = entries.map(([id, p]) => {
+    const priceLabel = p.price === 0 ? 'FREE' : `₹${p.price}`;
+    return [Markup.button.callback(`🛒 ${p.name} | ${priceLabel}`, `viewproduct_${id}`)];
+  });
+  buttons.push([Markup.button.callback('⬅️ Categories', 'menu_browse')]);
+  buttons.push([Markup.button.callback('🏠 Home', 'menu_home')]);
+
+  await smartReply(
+    ctx,
+    `📁 *${category}*\n\nExplore our full catalogue below — tap any product to view full details.`,
+    Markup.inlineKeyboard(buttons)
+  );
+});
+
+// ---- Product detail view (tap from any flat list) ----
+bot.action(/^viewproduct_(.+)$/, async (ctx) => {
+  const productId = ctx.match[1];
+  const product = await fb.getProduct(productId);
+
+  if (!product) {
+    return ctx.answerCbQuery('Product not found.');
   }
+
+  await ctx.answerCbQuery();
+  await fb.incrementProductViews(productId);
+  await sendProductCard(ctx, productId, product);
 });
 
 // ---- Reusable product card sender (used by category browse + search) ----
@@ -413,11 +481,13 @@ async function sendProductCard(ctx, id, p) {
   const { avg, count } = await fb.getProductAvgRating(id);
   const ratingLine = count > 0 ? `\n⭐ ${avg}/5 (${count} reviews)` : '';
   const stockLine = (p.stock !== undefined && p.stock !== -1) ? `\n📦 Stock: ${p.stock}` : '';
+  const viewsLine = p.views ? `\n👁 ${p.views} views` : '';
 
-  const caption = `*${p.name}*\n\n${p.description || ''}\n\n💰 Price: ₹${p.price}${ratingLine}${stockLine}`;
+  const caption = `*${p.name}*\n\n${p.description || ''}\n\n💰 Price: ₹${p.price}${ratingLine}${stockLine}${viewsLine}`;
   const buttons = Markup.inlineKeyboard([
     [Markup.button.callback('🛒 Buy Now', `buy_${id}`)],
-    [Markup.button.callback('⭐ Reviews', `reviews_${id}`)]
+    [Markup.button.callback('⭐ Reviews', `reviews_${id}`)],
+    [Markup.button.callback('🏠 Home', 'menu_home')]
   ]);
 
   // Support multiple images (imageUrls array) or fallback to single imageUrl
@@ -821,6 +891,22 @@ bot.command('unban', async (ctx) => {
   await ctx.reply(`✅ User ${targetId} unbanned.`);
 });
 
+bot.command('msg', async (ctx) => {
+  if (!fb.isAdmin(ctx.from.id)) return;
+  const parts = ctx.message.text.split(' ');
+  const targetId = parts[1];
+  const message = parts.slice(2).join(' ');
+
+  if (!targetId || !message) return ctx.reply('Usage: /msg <telegram_id> <message>');
+
+  try {
+    await bot.telegram.sendMessage(targetId, `📩 *Message from Admin:*\n\n${message}`, { parse_mode: 'Markdown' });
+    await ctx.reply(`✅ Message sent to ${targetId}.`);
+  } catch (err) {
+    await ctx.reply(`❌ Failed to send — user may have blocked the bot.`);
+  }
+});
+
 // Utility: send any file to bot to get its file_id (for product delivery setup)
 bot.on('document', async (ctx) => {
   if (!fb.isAdmin(ctx.from.id)) return;
@@ -837,16 +923,19 @@ bot.on('text', async (ctx) => {
     delete userState[ctx.from.id];
     const query = ctx.message.text.trim();
     const results = await fb.searchProducts(query);
-    const ids = Object.keys(results);
+    const entries = Object.entries(results);
 
-    if (ids.length === 0) {
-      return ctx.reply(`Koi product "${query}" naam se nahi mila. 🔍`);
+    if (entries.length === 0) {
+      return ctx.reply(`🔍 Koi product "${query}" naam se nahi mila.`);
     }
 
-    await ctx.reply(`🔍 ${ids.length} result(s) mile:`);
-    for (const id of ids) {
-      await sendProductCard(ctx, id, results[id]);
-    }
+    const buttons = entries.map(([id, p]) => {
+      const priceLabel = p.price === 0 ? 'FREE' : `₹${p.price}`;
+      return [Markup.button.callback(`🛒 ${p.name} | ${priceLabel}`, `viewproduct_${id}`)];
+    });
+    buttons.push([Markup.button.callback('🏠 Home', 'menu_home')]);
+
+    await ctx.reply(`🔍 *${entries.length} result(s) for "${query}"*`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
     return;
   }
 
@@ -1080,7 +1169,7 @@ app.get('/payment-timeout', (req, res) => {
 app.get('/', (req, res) => res.send('Bot server running ✅'));
 
 // ============ BROADCAST LISTENER ============
-// Admin panel writes to broadcastQueue/{id} with { message, sent:false }
+// Admin panel writes to broadcastQueue/{id} with { message, sent:false, buttonText?, buttonUrl? }
 // This listens in real-time and sends to all users, then marks sent:true
 
 fb.db.ref('broadcastQueue').on('child_added', async (snap) => {
@@ -1090,10 +1179,15 @@ fb.db.ref('broadcastQueue').on('child_added', async (snap) => {
   const users = await fb.getAllUsers();
   const userIds = Object.keys(users);
 
+  const extra = { parse_mode: 'Markdown' };
+  if (data.buttonText && data.buttonUrl) {
+    extra.reply_markup = { inline_keyboard: [[{ text: data.buttonText, url: data.buttonUrl }]] };
+  }
+
   let successCount = 0;
   for (const uid of userIds) {
     try {
-      await bot.telegram.sendMessage(uid, `📢 *Announcement*\n\n${data.message}`, { parse_mode: 'Markdown' });
+      await bot.telegram.sendMessage(uid, `📢 *Announcement*\n\n${data.message}`, extra);
       successCount++;
     } catch (e) {
       // user may have blocked the bot — skip silently
@@ -1103,6 +1197,26 @@ fb.db.ref('broadcastQueue').on('child_added', async (snap) => {
 
   await snap.ref.update({ sent: true, sentAt: Date.now(), sentCount: successCount });
   console.log(`📢 Broadcast sent to ${successCount}/${userIds.length} users`);
+});
+
+// ============ INDIVIDUAL DM LISTENER (from admin panel) ============
+// Admin panel writes to dmQueue/{id} with { userId, message, sent:false, buttonText?, buttonUrl? }
+
+fb.db.ref('dmQueue').on('child_added', async (snap) => {
+  const data = snap.val();
+  if (!data || data.sent || !data.userId || !data.message) return;
+
+  const extra = { parse_mode: 'Markdown' };
+  if (data.buttonText && data.buttonUrl) {
+    extra.reply_markup = { inline_keyboard: [[{ text: data.buttonText, url: data.buttonUrl }]] };
+  }
+
+  try {
+    await bot.telegram.sendMessage(data.userId, `📩 *Message from Admin:*\n\n${data.message}`, extra);
+    await snap.ref.update({ sent: true, sentAt: Date.now(), success: true });
+  } catch (err) {
+    await snap.ref.update({ sent: true, sentAt: Date.now(), success: false, error: err.message });
+  }
 });
 
 // ============ START SERVERS ============

@@ -24,6 +24,10 @@
       ".read": "auth != null",
       ".write": "auth != null"
     },
+    "dmQueue": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
     "coupons": {
       ".read": "auth != null",
       ".write": "auth != null"

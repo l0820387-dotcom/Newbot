@@ -430,12 +430,52 @@ async function getBotSettings() {
   const snap = await db.ref('botSettings').once('value');
   return snap.exists() ? snap.val() : {
     welcomeMessage: '👋 Welcome {name}!\n\nQuality you can count on, delivery you can rely on.\n\n🛍 Curated Products — paid & free\n💳 Secure Payments via UPI\n⚡ Instant Delivery after payment\n🛡 Dedicated Support, whenever you need it\n\n👇 Select an option below to begin',
-    channelUsername: '',
-    channelRequired: false,
+    channels: [],           // array of { username, required }
     supportTelegram: '',
     supportWhatsapp: '',
     botName: '',
-    botDescription: ''
+    botDescription: '',
+    maintenanceMode: false,
+    maintenanceMessage: '🛠 Bot abhi maintenance mein hai. Thodi der baad try karo.'
+  };
+}
+
+// ================= PRODUCT VIEWS =================
+
+async function incrementProductViews(productId) {
+  const ref = db.ref(`products/${productId}/views`);
+  const snap = await ref.once('value');
+  const current = snap.exists() ? snap.val() : 0;
+  await ref.set(current + 1);
+}
+
+// ================= PRODUCT EDIT =================
+
+async function updateProduct(productId, updates) {
+  await db.ref(`products/${productId}`).update(updates);
+}
+
+// ================= USER ANALYTICS (for admin panel) =================
+
+async function getUserAnalytics(telegramId) {
+  const user = await getUser(telegramId);
+  if (!user) return null;
+
+  const orders = await getUserOrders(telegramId);
+  const orderList = Object.values(orders);
+  const paidOrders = orderList.filter(o => o.status === 'paid' || o.status === 'delivered');
+  const totalSpent = paidOrders.reduce((sum, o) => sum + (o.amount || 0), 0);
+
+  // Count how many users this person referred
+  const allUsers = await getAllUsers();
+  const referredCount = Object.values(allUsers).filter(u => u.referredBy === String(telegramId)).length;
+
+  return {
+    ...user,
+    totalOrders: orderList.length,
+    completedOrders: paidOrders.length,
+    totalSpent,
+    referredCount
   };
 }
 
@@ -487,5 +527,8 @@ module.exports = {
   isUserVip,
   getVipDaysLeft,
   getBotSettings,
+  incrementProductViews,
+  updateProduct,
+  getUserAnalytics,
   isAdmin
 };
