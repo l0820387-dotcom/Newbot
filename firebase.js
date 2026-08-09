@@ -436,7 +436,9 @@ async function getBotSettings() {
     botName: '',
     botDescription: '',
     maintenanceMode: false,
-    maintenanceMessage: '🛠 Bot abhi maintenance mein hai. Thodi der baad try karo.'
+    maintenanceMessage: '🛠 Bot abhi maintenance mein hai. Thodi der baad try karo.',
+    menuCustomButtonText: '',   // extra button shown on the main menu, e.g. "Join Community"
+    menuCustomButtonUrl: ''
   };
 }
 

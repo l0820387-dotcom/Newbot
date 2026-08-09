@@ -17,6 +17,14 @@ const userState = {}; // { telegramId: { step, data } }
 // in that case we delete the old message and send a fresh one instead of
 // leaving a stray photo behind, which is what caused the "jumpy" feel.
 
+// Escapes Telegram Markdown (legacy) special characters in dynamic values
+// (names, product titles, etc.) so user-generated or DB text never breaks
+// message parsing. Use around any {variable} inserted into a Markdown string.
+function mdEscape(text) {
+  if (text === undefined || text === null) return '';
+  return String(text).replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+}
+
 async function smartReply(ctx, text, extra = {}) {
   const payload = { parse_mode: 'Markdown', ...extra };
 
@@ -25,13 +33,19 @@ async function smartReply(ctx, text, extra = {}) {
       await ctx.editMessageText(text, payload);
       return;
     } catch (err) {
-      // Can't edit (likely a photo message) — clean up instead of stacking messages
+      // Can't edit (likely a photo message, or a Markdown parse error) —
+      // clean up instead of stacking messages
       try { await ctx.deleteMessage(); } catch (e) { /* delete also failed, fine — we still send below */ }
     }
   }
 
-  // Always guaranteed to run if edit wasn't possible, regardless of delete outcome
-  await ctx.reply(text, payload);
+  // Guaranteed to run if edit wasn't possible. If Markdown parsing itself is
+  // the problem, retry once as plain text so the user always sees *something*.
+  try {
+    await ctx.reply(text, payload);
+  } catch (err) {
+    await ctx.reply(text, { ...extra, parse_mode: undefined });
+  }
 }
 
 // ---- Navigation stack: tracks which screen to return to on "Back" ----
@@ -180,11 +194,11 @@ async function sendMainMenu(ctx) {
   const settings = await fb.getBotSettings();
   const text = settings.welcomeMessage.replace('{name}', ctx.from.first_name);
 
-  await smartReply(ctx, text, mainMenu());
+  await smartReply(ctx, text, mainMenu(settings));
 }
 
-function mainMenu() {
-  return Markup.inlineKeyboard([
+function mainMenu(settings) {
+  const rows = [
     [Markup.button.callback('👤 My Profile', 'menu_profile')],
     [Markup.button.callback('🛍 Browse Products', 'menu_browse')],
     [Markup.button.callback('🎁 Free Products', 'menu_free')],
@@ -192,7 +206,14 @@ function mainMenu() {
     [Markup.button.callback('📋 Order Status', 'menu_orders'), Markup.button.callback('🔗 My Referrals', 'menu_referrals')],
     [Markup.button.callback('📊 My Stats', 'menu_stats'), Markup.button.callback('🧾 Payment History', 'menu_paymenthistory')],
     [Markup.button.callback('📞 Support', 'menu_support'), Markup.button.callback('🌐 Hindi / English', 'menu_language')]
-  ]);
+  ];
+
+  // Admin-configured custom button on the main menu (e.g. "Join Community")
+  if (settings?.menuCustomButtonText && settings?.menuCustomButtonUrl) {
+    rows.push([Markup.button.url(`🔗 ${settings.menuCustomButtonText}`, settings.menuCustomButtonUrl)]);
+  }
+
+  return Markup.inlineKeyboard(rows);
 }
 
 bot.action('menu_home', async (ctx) => {
@@ -211,7 +232,15 @@ bot.action('menu_profile', async (ctx) => {
 
 async function renderProfile(ctx) {
   const telegramId = ctx.from.id;
-  const user = await fb.getUser(telegramId);
+  let user = await fb.getUser(telegramId);
+
+  // Safety net: user record should always exist after /start, but if it's
+  // somehow missing, create it now instead of crashing the whole handler
+  // silently (which was the root cause of "everything disappears").
+  if (!user) {
+    user = await fb.createUserIfNotExists(telegramId, ctx.from, null);
+  }
+
   const balance = await fb.getWalletBalance(telegramId);
   const isVip = await fb.isUserVip(telegramId);
   const vipDays = isVip ? await fb.getVipDaysLeft(telegramId) : 0;
@@ -220,7 +249,7 @@ async function renderProfile(ctx) {
 
   const vipLine = isVip ? `👑 VIP Active — ${vipDays} days left` : '👤 Free User';
 
-  const msg = `👤 *My Profile*\n\n✨ Name: ${user.name}\n🔖 Username: ${user.username ? '@' + user.username : '-'}\n🆔 Telegram ID: \`${telegramId}\`\n\n${vipLine}\n💰 Wallet: ₹${balance}\n📦 Total Orders: ${orderCount}\n🔗 Referral Code: \`${user.referralCode}\``;
+  const msg = `👤 *My Profile*\n\n✨ Name: ${mdEscape(user.name)}\n🔖 Username: ${user.username ? '@' + mdEscape(user.username) : '-'}\n🆔 Telegram ID: \`${telegramId}\`\n\n${vipLine}\n💰 Wallet: ₹${balance}\n📦 Total Orders: ${orderCount}\n🔗 Referral Code: \`${user.referralCode}\``;
 
   await smartReply(ctx, msg, backButton(ctx));
 }
@@ -239,12 +268,24 @@ function backButton(ctx) {
 
 // Generic handler: pops the nav stack and shows the previous screen directly.
 // We call the underlying screen-render functions directly (not re-dispatching
-// fake Telegram events, which is fragile) — so Back only supports screens with
-// a simple, no-argument render function. Anything else falls back to Home.
+// fake Telegram events, which is fragile). Supports both simple no-argument
+// screens and dynamic ones (category name, product id) parsed from the target.
 bot.action('nav_back', async (ctx) => {
   await ctx.answerCbQuery();
   const telegramId = ctx.from.id;
   const target = popNav(telegramId);
+
+  // Dynamic targets: cat_<CategoryName>, viewproduct_<id>
+  if (target.startsWith('cat_')) {
+    const category = target.slice(4);
+    return renderCategoryProducts(ctx, category);
+  }
+  if (target.startsWith('viewproduct_')) {
+    const productId = target.slice('viewproduct_'.length);
+    const product = await fb.getProduct(productId);
+    if (product) return sendProductCard(ctx, productId, product);
+    return sendMainMenu(ctx);
+  }
 
   const screenRenderers = {
     menu_home: () => sendMainMenu(ctx),
@@ -371,7 +412,7 @@ async function renderOrderStatus(ctx) {
   let msg = '📋 *Order Status*\n\n';
   list.slice(0, 10).forEach(o => {
     const statusEmoji = o.status === 'delivered' ? '✅' : o.status === 'pending' ? '⏳' : o.status === 'failed' ? '❌' : o.status === 'refunded' ? '↩️' : '🔄';
-    msg += `${statusEmoji} ${o.productName} — ₹${o.amount} _(${o.status})_\n`;
+    msg += `${statusEmoji} ${mdEscape(o.productName)} — ₹${o.amount} _(${o.status})_\n`;
   });
 
   const refundable = list.find(o => o.status === 'delivered' && !o.refundStatus && o.productId !== 'PRO_PLAN' && o.productId !== 'WALLET_TOPUP');
@@ -560,6 +601,17 @@ bot.action(/^cat_(.+)$/, async (ctx) => {
 
   await ctx.answerCbQuery();
   pushNav(telegramId, `cat_${category}`);
+  await renderCategoryProducts(ctx, category);
+});
+
+async function renderCategoryProducts(ctx, category) {
+  const telegramId = ctx.from.id;
+  const products = await fb.getProductsByCategory(category);
+  const entries = Object.entries(products);
+
+  if (entries.length === 0) {
+    return smartReply(ctx, `📁 *${mdEscape(category)}*\n\nIs category mein abhi koi product nahi hai.`, backButton(ctx));
+  }
 
   const buttons = entries.map(([id, p]) => {
     const priceLabel = p.price === 0 ? 'FREE' : `₹${p.price}`;
@@ -568,10 +620,10 @@ bot.action(/^cat_(.+)$/, async (ctx) => {
 
   await smartReply(
     ctx,
-    `📁 *${category}*\n\n✨ Explore our full catalogue below — tap any product to view full details.`,
+    `📁 *${mdEscape(category)}*\n\n✨ Explore our full catalogue below — tap any product to view full details.`,
     navButtons(buttons, telegramId)
   );
-});
+}
 
 // ---- Product detail view (tap from any flat list) ----
 bot.action(/^viewproduct_(.+)$/, async (ctx) => {
@@ -589,15 +641,26 @@ bot.action(/^viewproduct_(.+)$/, async (ctx) => {
 });
 
 // ---- Reusable product card sender (used by category browse + search) ----
+// Deletes the message that triggered a callback (if any) before sending
+// new content that can't use editMessageText (photos, media groups). This
+// prevents old button-bearing messages from being left behind in the chat.
+async function deleteTriggerMessage(ctx) {
+  if (ctx.callbackQuery) {
+    try { await ctx.deleteMessage(); } catch (e) { /* already gone or too old — fine */ }
+  }
+}
+
 async function sendProductCard(ctx, id, p) {
   const telegramId = ctx.from.id;
+  await deleteTriggerMessage(ctx);
+
   const { avg, count } = await fb.getProductAvgRating(id);
   const ratingLine = count > 0 ? `\n⭐ ${avg}/5 _(${count} reviews)_` : '';
   const stockLine = (p.stock !== undefined && p.stock !== -1) ? `\n📦 Stock: ${p.stock}` : '';
   const viewsLine = p.views ? `\n👁 ${p.views} views` : '';
   const priceLabel = p.price === 0 ? '*FREE* 🎁' : `*₹${p.price}*`;
 
-  const caption = `✨ *${p.name}*\n\n${p.description || ''}\n\n💰 Price: ${priceLabel}${ratingLine}${stockLine}${viewsLine}`;
+  const caption = `✨ *${mdEscape(p.name)}*\n\n${mdEscape(p.description) || ''}\n\n💰 Price: ${priceLabel}${ratingLine}${stockLine}${viewsLine}`;
 
   const rows = [
     [Markup.button.callback('🛒 Buy Now', `buy_${id}`)],
@@ -781,7 +844,7 @@ bot.action(/^paywallet_([^_]+)(?:_(.+))?$/, async (ctx) => {
 
   if (productId !== 'PRO_PLAN' && await fb.hasUserBoughtProduct(telegramId, productId)) {
     await ctx.answerCbQuery();
-    return ctx.reply('✅ Yeh product aap pehle hi khareed chuke ho.');
+    return smartReply(ctx, '✅ Yeh product aap pehle hi khareed chuke ho.', backButton(ctx));
   }
 
   let finalPrice = product.price;
@@ -797,7 +860,11 @@ bot.action(/^paywallet_([^_]+)(?:_(.+))?$/, async (ctx) => {
   const balance = await fb.getWalletBalance(telegramId);
   if (balance < finalPrice) {
     await ctx.answerCbQuery();
-    return ctx.reply(`❌ Insufficient wallet balance.\n\nBalance: ₹${balance}\nRequired: ₹${finalPrice}\n\nZabupi se add money karo pehle.`);
+    return smartReply(
+      ctx,
+      `❌ *Insufficient wallet balance*\n\n💰 Balance: ₹${balance}\n💳 Required: ₹${finalPrice}\n\nZapUPI se add money karo pehle.`,
+      navButtons([[Markup.button.callback('➕ Add Money', 'addmoney')]], telegramId)
+    );
   }
 
   await ctx.answerCbQuery('Processing...');
@@ -824,7 +891,7 @@ bot.action(/^paywallet_([^_]+)(?:_(.+))?$/, async (ctx) => {
     await deliverProduct(ctx, product, order.id);
   } catch (err) {
     console.error(err);
-    await ctx.reply('❌ Payment failed. Please try again or contact support.');
+    await smartReply(ctx, '❌ *Payment failed.*\n\nPlease try again ya support se contact karo.', backButton(ctx));
   }
 });
 
@@ -839,7 +906,7 @@ bot.action(/^payzabupi_([^_]+)(?:_(.+))?$/, async (ctx) => {
 
   if (productId !== 'PRO_PLAN' && await fb.hasUserBoughtProduct(telegramId, productId)) {
     await ctx.answerCbQuery();
-    return ctx.reply('✅ Yeh product aap pehle hi khareed chuke ho.');
+    return smartReply(ctx, '✅ Yeh product aap pehle hi khareed chuke ho.', backButton(ctx));
   }
 
   let finalPrice = product.price;
@@ -853,6 +920,9 @@ bot.action(/^payzabupi_([^_]+)(?:_(.+))?$/, async (ctx) => {
   }
 
   await ctx.answerCbQuery('Generating payment link...');
+  // Edit the SAME message through the whole flow (loading → result) so
+  // nothing gets left behind in the chat.
+  await smartReply(ctx, '⏳ *Payment link generate ho raha hai...*', navButtons([[Markup.button.callback('❌ Cancel', 'menu_home')]], telegramId));
 
   const order = await fb.createOrder({
     userId: String(telegramId),
@@ -874,20 +944,37 @@ bot.action(/^payzabupi_([^_]+)(?:_(.+))?$/, async (ctx) => {
 
   if (!payment.success) {
     await fb.updateOrderStatus(order.id, 'failed');
-    return ctx.reply('❌ Payment link generate nahi ho payi. Thodi der baad try karo.');
+    console.error('ZapUPI payment creation failed for order', order.id, ':', payment.error);
+    return smartReply(
+      ctx,
+      `❌ *Payment link generate nahi ho paya*\n\nWajah: ${mdEscape(typeof payment.error === 'string' ? payment.error : JSON.stringify(payment.error))}\n\nThodi der baad try karo ya support se contact karo.`,
+      navButtons([[Markup.button.callback('🔄 Try Again', `payzabupi_${productId}${couponCode ? '_' + couponCode : ''}`)]], telegramId)
+    );
   }
 
   await fb.updateOrderStatus(order.id, 'pending', { zabupiTxnId: payment.transactionId });
 
-  await ctx.reply(
-    `💳 Payment link ready!\n\n*${product.name}* — ₹${finalPrice}\n\nNeeche link pe click karke payment complete karo. Payment hote hi product turant deliver ho jaayega ✅`,
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [Markup.button.url('💳 Pay Now', payment.paymentUrl)]
-      ])
-    }
+  await smartReply(
+    ctx,
+    `💳 *Payment link ready!*\n\n${mdEscape(product.name)} — ₹${finalPrice}\n\nNeeche link pe click karke payment complete karo. Payment hote hi product turant deliver ho jaayega ✅`,
+    Markup.inlineKeyboard([
+      [Markup.button.url('💳 Pay Now', payment.paymentUrl)],
+      [Markup.button.callback('❌ Cancel Order', `cancelorder_${order.id}`), Markup.button.callback('🏠 Home', 'menu_home')]
+    ])
   );
+});
+
+// ---- Cancel a pending order ----
+bot.action(/^cancelorder_(.+)$/, async (ctx) => {
+  const orderId = ctx.match[1];
+  await ctx.answerCbQuery();
+
+  const order = await fb.getOrder(orderId);
+  if (order && order.status === 'pending') {
+    await fb.updateOrderStatus(orderId, 'failed', { cancelledByUser: true });
+  }
+
+  await smartReply(ctx, '❌ Order cancel kar diya gaya.', backButton(ctx));
 });
 
 // ---- Low stock alert helper ----
@@ -916,7 +1003,11 @@ bot.action(/^redeliver_(.+)$/, async (ctx) => {
 
 async function deliverProduct(ctx, product, orderId, silent) {
   if (!silent) {
-    await ctx.reply(`✅ Payment successful! Delivering *${product.name}*...`, { parse_mode: 'Markdown' });
+    // Edit the triggering message (e.g. "Processing...") to show delivery
+    // status instead of stacking a new message on top of it.
+    await smartReply(ctx, `✅ *Payment successful!*\n\nDelivering ${mdEscape(product.name)}...`, {});
+  } else {
+    await deleteTriggerMessage(ctx);
   }
 
   try {
@@ -926,7 +1017,7 @@ async function deliverProduct(ctx, product, orderId, silent) {
       });
     } else if (product.deliveryType === 'link' && product.deliveryLink) {
       await ctx.reply(
-        `📦 *${product.name}*\n\n🔗 Download Link:\n${product.deliveryLink}\n\nThank you for your purchase! 🙏`,
+        `📦 *${mdEscape(product.name)}*\n\n🔗 Download Link:\n${product.deliveryLink}\n\nThank you for your purchase! 🙏`,
         { parse_mode: 'Markdown' }
       );
     } else {
@@ -938,7 +1029,17 @@ async function deliverProduct(ctx, product, orderId, silent) {
     }
   } catch (err) {
     console.error('Delivery error:', err);
-    await ctx.reply('⚠️ Delivery mein issue aaya. Support team ko inform kar diya gaya hai.');
+    await ctx.reply(
+      '⚠️ *Delivery mein issue aaya.*\n\nAapka payment safe hai — support team ko turant inform kar diya gaya hai, jald hi resolve hoga.',
+      { parse_mode: 'Markdown', ...backButton(ctx) }
+    );
+
+    const adminIds = (process.env.ADMIN_TELEGRAM_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+    for (const adminId of adminIds) {
+      try {
+        await bot.telegram.sendMessage(adminId, `🚨 *Delivery Failed*\n\nOrder: ${orderId || 'N/A'}\nProduct: ${mdEscape(product.name)}\nUser: ${ctx.from.id}\nError: ${mdEscape(err.message)}`, { parse_mode: 'Markdown' });
+      } catch (e) {}
+    }
   }
 }
 
@@ -1188,85 +1289,112 @@ app.post('/admin-api/set-bot-description', async (req, res) => {
 
 // ============ ZABUPI (ZapUPI) WEBHOOK (Express server) ============
 
+// Checks ZapUPI's real order status and processes delivery if paid. Shared
+// by both the webhook endpoint (in case ZapUPI does call it) and the
+// polling loop below (the reliable path, since webhook_url isn't in
+// ZapUPI's documented create-order fields).
+async function checkAndProcessOrder(orderId) {
+  const order = await fb.getOrder(orderId);
+  if (!order) return { processed: false, reason: 'not_found' };
+  if (order.status === 'delivered' || order.status === 'paid') {
+    return { processed: false, reason: 'already_done' };
+  }
+
+  const statusCheck = await zabupi.checkPaymentStatus(orderId);
+  const statusData = statusCheck?.data || statusCheck;
+  const status = statusData ? String(statusData.status).toLowerCase() : null;
+
+  if (status === 'failed') {
+    await fb.updateOrderStatus(orderId, 'failed');
+    return { processed: true, reason: 'failed' };
+  }
+  if (status !== 'success') {
+    return { processed: false, reason: 'still_pending' }; // keep polling
+  }
+
+  const transaction_id = statusData.txn_id || null;
+  await fb.updateOrderStatus(orderId, 'paid', { zabupiTxnId: transaction_id });
+
+  // Wallet top-up
+  if (order.productId === 'WALLET_TOPUP' || order.isWalletTopup) {
+    await fb.creditWallet(order.userId, order.amount, 'topup');
+    await bot.telegram.sendMessage(order.userId, `✅ ₹${order.amount} added to your wallet!`);
+    await fb.updateOrderStatus(orderId, 'delivered', { deliveredAt: Date.now() });
+    return { processed: true, reason: 'topup_done' };
+  }
+
+  // Pro Plan subscription
+  if (order.productId === 'PRO_PLAN' || order.isProPlan) {
+    const duration = order.proPlanDuration || 30;
+    const newExpiry = await fb.activateProPlan(order.userId, duration);
+    await bot.telegram.sendMessage(
+      order.userId,
+      `👑 *Pro Plan Activated!*\n\nAap ab VIP hain — sab paid products FREE mein download kar sakte ho.\n\nExpires: ${new Date(newExpiry).toLocaleDateString()}`,
+      { parse_mode: 'Markdown' }
+    );
+    await fb.updateOrderStatus(orderId, 'delivered', { deliveredAt: Date.now() });
+    return { processed: true, reason: 'proplan_done' };
+  }
+
+  // Regular product purchase
+  const product = await fb.getProduct(order.productId);
+  await fb.processReferralBonus(order.userId, order.amount);
+  if (order.couponUsed) await fb.incrementCouponUsage(order.couponUsed);
+  await fb.decrementStock(order.productId);
+  await checkAndAlertLowStock(order.productId);
+
+  if (product) {
+    try {
+      if (product.deliveryType === 'file' && product.fileId) {
+        await bot.telegram.sendDocument(order.userId, product.fileId, {
+          caption: `📦 ${product.name}\n\nThank you for your purchase! 🙏`
+        });
+      } else if (product.deliveryType === 'link' && product.deliveryLink) {
+        await bot.telegram.sendMessage(
+          order.userId,
+          `✅ Payment successful!\n\n📦 *${product.name}*\n\n🔗 Download Link:\n${product.deliveryLink}\n\nThank you! 🙏`,
+          { parse_mode: 'Markdown' }
+        );
+      }
+      await fb.updateOrderStatus(orderId, 'delivered', { deliveredAt: Date.now() });
+    } catch (deliveryErr) {
+      console.error('Delivery error:', deliveryErr);
+    }
+  }
+
+  return { processed: true, reason: 'delivered' };
+}
+
+// ---- Polling loop: ZapUPI's documented create-order payload has no
+// webhook_url field, so we can't rely on a push callback. Every 20s we
+// check all pending ZapUPI orders from the last hour and process any that
+// have completed. This is the reliable confirmation path.
+setInterval(async () => {
+  try {
+    const cutoff = Date.now() - 60 * 60 * 1000; // only check orders from the last hour
+    const snap = await fb.db.ref('orders')
+      .orderByChild('status')
+      .equalTo('pending')
+      .once('value');
+    if (!snap.exists()) return;
+
+    const orders = snap.val();
+    for (const [orderId, order] of Object.entries(orders)) {
+      if (order.paymentMethod !== 'zabupi') continue;
+      if (order.createdAt < cutoff) continue;
+      await checkAndProcessOrder(orderId);
+    }
+  } catch (err) {
+    console.error('Payment polling error:', err);
+  }
+}, 20000);
+
 app.post('/webhook/zabupi', async (req, res) => {
   try {
-    const payload = req.body;
+    const orderId = req.body.order_id;
+    if (!orderId) return res.status(400).send('Missing order_id');
 
-    // ZapUPI's webhook payload field names — confirm exact shape against a real
-    // webhook hit once live; this follows their create-order response naming.
-    const order_id = payload.order_id;
-
-    if (!order_id) {
-      console.warn('⚠️ Webhook missing order_id', payload);
-      return res.status(400).send('Missing order_id');
-    }
-
-    const order = await fb.getOrder(order_id);
-    if (!order) return res.status(404).send('Order not found');
-    if (order.status === 'delivered' || order.status === 'paid') {
-      return res.status(200).send('Already processed'); // idempotency
-    }
-
-    // No confirmed webhook signature scheme for ZapUPI — re-verify by polling
-    // their order-status endpoint directly rather than trusting the webhook body.
-    const statusCheck = await zabupi.checkPaymentStatus(order_id);
-    const isPaid = statusCheck && (statusCheck.status === 'success' || statusCheck.status === 'paid' || statusCheck.txn_status === 'success');
-
-    if (!isPaid) {
-      await fb.updateOrderStatus(order_id, 'failed');
-      return res.status(200).send('OK');
-    }
-
-    const transaction_id = statusCheck.txn_id || payload.txn_id || null;
-    await fb.updateOrderStatus(order_id, 'paid', { zabupiTxnId: transaction_id });
-
-    // Handle wallet top-up
-    if (order.productId === 'WALLET_TOPUP' || order.isWalletTopup) {
-      await fb.creditWallet(order.userId, order.amount, 'topup');
-      await bot.telegram.sendMessage(order.userId, `✅ ₹${order.amount} added to your wallet!`);
-      await fb.updateOrderStatus(order_id, 'delivered', { deliveredAt: Date.now() });
-      return res.status(200).send('OK');
-    }
-
-    // Handle Pro Plan subscription
-    if (order.productId === 'PRO_PLAN' || order.isProPlan) {
-      const duration = order.proPlanDuration || 30;
-      const newExpiry = await fb.activateProPlan(order.userId, duration);
-      await bot.telegram.sendMessage(
-        order.userId,
-        `👑 *Pro Plan Activated!*\n\nAap ab VIP hain — sab paid products FREE mein download kar sakte ho.\n\nExpires: ${new Date(newExpiry).toLocaleDateString()}`,
-        { parse_mode: 'Markdown' }
-      );
-      await fb.updateOrderStatus(order_id, 'delivered', { deliveredAt: Date.now() });
-      return res.status(200).send('OK');
-    }
-
-    // Handle product purchase
-    const product = await fb.getProduct(order.productId);
-    await fb.processReferralBonus(order.userId, order.amount);
-    if (order.couponUsed) await fb.incrementCouponUsage(order.couponUsed);
-    await fb.decrementStock(order.productId);
-    await checkAndAlertLowStock(order.productId);
-
-    if (product) {
-      try {
-        if (product.deliveryType === 'file' && product.fileId) {
-          await bot.telegram.sendDocument(order.userId, product.fileId, {
-            caption: `📦 ${product.name}\n\nThank you for your purchase! 🙏`
-          });
-        } else if (product.deliveryType === 'link' && product.deliveryLink) {
-          await bot.telegram.sendMessage(
-            order.userId,
-            `✅ Payment successful!\n\n📦 *${product.name}*\n\n🔗 Download Link:\n${product.deliveryLink}\n\nThank you! 🙏`,
-            { parse_mode: 'Markdown' }
-          );
-        }
-        await fb.updateOrderStatus(order_id, 'delivered', { deliveredAt: Date.now() });
-      } catch (deliveryErr) {
-        console.error('Webhook delivery error:', deliveryErr);
-      }
-    }
-
+    await checkAndProcessOrder(orderId);
     res.status(200).send('OK');
   } catch (err) {
     console.error('Webhook error:', err);
@@ -1343,6 +1471,24 @@ fb.db.ref('dmQueue').on('child_added', async (snap) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 Webhook server running on port ${PORT}`));
+
+// ============ GLOBAL ERROR HANDLER ============
+// Without this, any unhandled error in a handler (bad data, network blip,
+// etc.) fails completely silently — the user sees nothing happen at all,
+// which is what caused "My Profile" to appear to do nothing. This ensures
+// something is always shown, and logs the real error for debugging.
+
+bot.catch(async (err, ctx) => {
+  console.error('❌ Unhandled bot error:', err);
+  try {
+    if (ctx.callbackQuery) {
+      await ctx.answerCbQuery('⚠️ Something went wrong, please try again.', { show_alert: true });
+    }
+    await ctx.reply('⚠️ Kuch galat ho gaya. Please /start dobara karo ya thodi der baad try karo.');
+  } catch (e) {
+    // Even the fallback failed (e.g. user blocked bot) — nothing more we can do
+  }
+});
 
 bot.launch().then(() => console.log('🤖 Bot started successfully'));
 
