@@ -7,7 +7,7 @@
     "orders": {
       ".read": "auth != null",
       ".write": "auth != null",
-      ".indexOn": ["status", "userId"]
+      ".indexOn": ["status", "userId", "payRef"]
     },
     "users": {
       ".read": "auth != null",

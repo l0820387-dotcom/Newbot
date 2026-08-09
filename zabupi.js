@@ -1,18 +1,18 @@
 require('dotenv').config();
 const axios = require('axios');
 
-// NOTE: The gateway is actually called "ZapUPI" (not "Zabupi") — base URL confirmed
-// from https://zapupi.com/docs
+// Gateway is "ZapUPI" — confirmed base URL and payload shape from https://zapupi.com/docs
 const ZABUPI_BASE_URL = process.env.ZABUPI_BASE_URL || 'https://pay.zapupi.com/api';
-const ZABUPI_API_KEY = process.env.ZABUPI_API_KEY; // this is the "zap_key" ZapUPI gives you
+const ZABUPI_API_KEY = process.env.ZABUPI_API_KEY; // this is the "zap_key" from your ZapUPI dashboard
 
 /**
  * Creates a payment order with ZapUPI and returns a payment link.
- * Matches the documented ZapUPI /create-order endpoint exactly.
  * Docs: https://zapupi.com/docs
  *
- * Required by ZapUPI: zap_key, order_id, amount, customer_mobile, remark,
- * success_url, failed_url, timeout_url, webhook_url
+ * IMPORTANT: ZapUPI's own docs explicitly say NOT to send success_url,
+ * failed_url, or timeout_url — sending them causes the request to fail
+ * silently or be rejected. Only zap_key, order_id, amount are required;
+ * customer_mobile and remark are optional.
  */
 async function createPaymentOrder({ orderId, amount, userId, userName, userMobile, purpose }) {
   try {
@@ -22,15 +22,8 @@ async function createPaymentOrder({ orderId, amount, userId, userName, userMobil
         zap_key: ZABUPI_API_KEY,
         order_id: String(orderId),
         amount: String(amount),
-        // ZapUPI requires a mobile number. Telegram doesn't give us one by default,
-        // so we fall back to a dummy number if not collected. Real UPI collection
-        // still works via the payment_url — this field is mainly for their records.
         customer_mobile: userMobile || '9999999999',
-        remark: purpose || 'Digital Product Purchase',
-        success_url: `${process.env.WEBHOOK_BASE_URL}/payment-success?orderId=${orderId}`,
-        failed_url: `${process.env.WEBHOOK_BASE_URL}/payment-failed?orderId=${orderId}`,
-        timeout_url: `${process.env.WEBHOOK_BASE_URL}/payment-timeout?orderId=${orderId}`,
-        webhook_url: `${process.env.WEBHOOK_BASE_URL}/webhook/zabupi`
+        remark: purpose || 'Digital Product Purchase'
       },
       { headers: { 'Content-Type': 'application/json' } }
     );
@@ -38,7 +31,7 @@ async function createPaymentOrder({ orderId, amount, userId, userName, userMobil
     const data = response.data;
 
     if (data.status !== 'success') {
-      return { success: false, error: data.message || 'Order creation failed' };
+      return { success: false, error: data.message || JSON.stringify(data) };
     }
 
     return {
@@ -48,29 +41,24 @@ async function createPaymentOrder({ orderId, amount, userId, userName, userMobil
     };
   } catch (err) {
     console.error('ZapUPI order creation failed:', err.response?.data || err.message);
-    return { success: false, error: err.response?.data || err.message };
+    return { success: false, error: err.response?.data ? JSON.stringify(err.response.data) : err.message };
   }
 }
 
 /**
- * Verifies webhook signature — NOTE: ZapUPI's docs (as found) don't show a
- * documented HMAC signing scheme for webhooks. Confirm with ZapUPI support
- * whether they sign requests. Until confirmed, this treats the webhook as
- * trusted based on knowing your own webhook_url is secret + validated by
- * re-checking the order status via checkPaymentStatus() below before
- * marking anything paid (see bot.js webhook handler).
+ * Verifies webhook signature — ZapUPI's docs don't document a signature
+ * scheme for webhooks. bot.js re-verifies via checkPaymentStatus() before
+ * marking anything paid, rather than trusting the webhook body alone.
  */
 function verifyWebhookSignature(payload, signatureHeader) {
-  // No documented signature scheme found for ZapUPI webhooks.
-  // Safer approach used in bot.js: always re-verify via checkPaymentStatus()
-  // rather than trusting the webhook body alone.
   return true;
 }
 
 /**
  * Polls ZapUPI's order-status endpoint to confirm real payment status.
- * Use this to double check before delivering a product — don't trust the
- * webhook payload alone since we couldn't confirm its signing scheme.
+ * Response fields per ZapUPI docs: data.status ("Pending"|"Success"|"Failed"),
+ * data.amount, data.txn_id, data.utr, data.custumer_mobile (sic — typo in
+ * their API), data.create_at.
  */
 async function checkPaymentStatus(orderId) {
   try {
@@ -82,7 +70,7 @@ async function checkPaymentStatus(orderId) {
       },
       { headers: { 'Content-Type': 'application/json' } }
     );
-    return response.data; // check actual field names against a real response before going live
+    return response.data;
   } catch (err) {
     console.error('ZapUPI status check failed:', err.response?.data || err.message);
     return null;

@@ -278,9 +278,15 @@ async function incrementCouponUsage(code) {
 
 async function createOrder(orderData) {
   const orderRef = db.ref('orders').push();
+  // ZapUPI rejects order_id values containing hyphens/underscores (Firebase
+  // push keys look like "-NxAbC_123"), causing "Invalid Order ID" errors.
+  // We generate a clean alphanumeric reference for ZapUPI and store it
+  // alongside the real Firebase order id, so we can look either one up.
+  const payRef = 'ord' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   const order = {
     ...orderData,
     id: orderRef.key,
+    payRef,
     createdAt: Date.now(),
     status: 'pending'
   };
@@ -295,6 +301,14 @@ async function updateOrderStatus(orderId, status, extra = {}) {
 async function getOrder(orderId) {
   const snap = await db.ref(`orders/${orderId}`).once('value');
   return snap.exists() ? snap.val() : null;
+}
+
+async function getOrderByPayRef(payRef) {
+  const snap = await db.ref('orders').orderByChild('payRef').equalTo(payRef).once('value');
+  if (!snap.exists()) return null;
+  const val = snap.val();
+  const key = Object.keys(val)[0];
+  return { ...val[key], id: key };
 }
 
 async function getUserOrders(telegramId) {
@@ -437,8 +451,8 @@ async function getBotSettings() {
     botDescription: '',
     maintenanceMode: false,
     maintenanceMessage: '🛠 Bot abhi maintenance mein hai. Thodi der baad try karo.',
-    menuCustomButtonText: '',   // extra button shown on the main menu, e.g. "Join Community"
-    menuCustomButtonUrl: ''
+    menuCustomButtons: [],   // array of { text, url } — extra buttons shown on main menu
+    menuLabels: {}           // overrides for built-in button labels, e.g. { profile: '👤 Mera Profile' }
   };
 }
 
@@ -517,6 +531,7 @@ module.exports = {
   createOrder,
   updateOrderStatus,
   getOrder,
+  getOrderByPayRef,
   getUserOrders,
   hasUserBoughtProduct,
   requestRefund,

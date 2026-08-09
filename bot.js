@@ -197,21 +197,41 @@ async function sendMainMenu(ctx) {
   await smartReply(ctx, text, mainMenu(settings));
 }
 
+// Default labels for the built-in menu buttons — admin can override any of
+// these from the Bot Settings > Menu Buttons panel without touching code.
+const DEFAULT_MENU_LABELS = {
+  profile: '👤 My Profile',
+  browse: '🛍 Browse Products',
+  free: '🎁 Free Products',
+  proplan: '👑 Pro Plan',
+  purchases: '📦 My Purchases',
+  orders: '📋 Order Status',
+  referrals: '🔗 My Referrals',
+  stats: '📊 My Stats',
+  paymenthistory: '🧾 Payment History',
+  support: '📞 Support',
+  language: '🌐 Hindi / English'
+};
+
 function mainMenu(settings) {
+  const labels = { ...DEFAULT_MENU_LABELS, ...(settings?.menuLabels || {}) };
+
   const rows = [
-    [Markup.button.callback('👤 My Profile', 'menu_profile')],
-    [Markup.button.callback('🛍 Browse Products', 'menu_browse')],
-    [Markup.button.callback('🎁 Free Products', 'menu_free')],
-    [Markup.button.callback('👑 Pro Plan', 'menu_proplan'), Markup.button.callback('📦 My Purchases', 'menu_purchases')],
-    [Markup.button.callback('📋 Order Status', 'menu_orders'), Markup.button.callback('🔗 My Referrals', 'menu_referrals')],
-    [Markup.button.callback('📊 My Stats', 'menu_stats'), Markup.button.callback('🧾 Payment History', 'menu_paymenthistory')],
-    [Markup.button.callback('📞 Support', 'menu_support'), Markup.button.callback('🌐 Hindi / English', 'menu_language')]
+    [Markup.button.callback(labels.profile, 'menu_profile')],
+    [Markup.button.callback(labels.browse, 'menu_browse')],
+    [Markup.button.callback(labels.free, 'menu_free')],
+    [Markup.button.callback(labels.proplan, 'menu_proplan'), Markup.button.callback(labels.purchases, 'menu_purchases')],
+    [Markup.button.callback(labels.orders, 'menu_orders'), Markup.button.callback(labels.referrals, 'menu_referrals')],
+    [Markup.button.callback(labels.stats, 'menu_stats'), Markup.button.callback(labels.paymenthistory, 'menu_paymenthistory')],
+    [Markup.button.callback(labels.support, 'menu_support'), Markup.button.callback(labels.language, 'menu_language')]
   ];
 
-  // Admin-configured custom button on the main menu (e.g. "Join Community")
-  if (settings?.menuCustomButtonText && settings?.menuCustomButtonUrl) {
-    rows.push([Markup.button.url(`🔗 ${settings.menuCustomButtonText}`, settings.menuCustomButtonUrl)]);
-  }
+  // Admin-configured custom link buttons on the main menu (e.g. "Join Community").
+  // Supports multiple — each one is its own row.
+  const customButtons = Array.isArray(settings?.menuCustomButtons) ? settings.menuCustomButtons : [];
+  customButtons.forEach(btn => {
+    if (btn.text && btn.url) rows.push([Markup.button.url(`🔗 ${btn.text}`, btn.url)]);
+  });
 
   return Markup.inlineKeyboard(rows);
 }
@@ -335,9 +355,11 @@ async function renderProPlan(ctx) {
 }
 
 bot.action('buyproplan', async (ctx) => {
-  await ctx.answerCbQuery('Generating payment link...');
   const telegramId = ctx.from.id;
   const settings = await fb.getProPlanSettings();
+
+  await ctx.answerCbQuery('Generating payment link...');
+  await smartReply(ctx, '⏳ *Payment link generate ho raha hai...*', navButtons([[Markup.button.callback('❌ Cancel', 'menu_home')]], telegramId));
 
   const order = await fb.createOrder({
     userId: String(telegramId),
@@ -350,7 +372,7 @@ bot.action('buyproplan', async (ctx) => {
   });
 
   const payment = await zabupi.createPaymentOrder({
-    orderId: order.id,
+    orderId: order.payRef,
     amount: settings.price,
     userId: telegramId,
     userName: ctx.from.first_name,
@@ -359,14 +381,23 @@ bot.action('buyproplan', async (ctx) => {
 
   if (!payment.success) {
     await fb.updateOrderStatus(order.id, 'failed');
-    return ctx.reply('❌ Payment link generate nahi ho payi. Thodi der baad try karo.');
+    console.error('ZapUPI Pro Plan payment failed for order', order.id, ':', payment.error);
+    return smartReply(
+      ctx,
+      `❌ *Payment link generate nahi ho paya*\n\nWajah: ${mdEscape(typeof payment.error === 'string' ? payment.error : JSON.stringify(payment.error))}\n\nThodi der baad try karo ya support se contact karo.`,
+      navButtons([[Markup.button.callback('🔄 Try Again', 'buyproplan')]], telegramId)
+    );
   }
 
   await fb.updateOrderStatus(order.id, 'pending', { zabupiTxnId: payment.transactionId });
 
-  await ctx.reply(
-    `💳 *Pro Plan* — ₹${settings.price}\n\nPay karke turant VIP activate ho jayega ✅`,
-    { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.url('💳 Pay Now', payment.paymentUrl)]]) }
+  await smartReply(
+    ctx,
+    `💳 *Pro Plan* — ₹${settings.price}\n\n✨ Pay karke turant VIP activate ho jayega ✅`,
+    Markup.inlineKeyboard([
+      [Markup.button.url('💳 Pay Now', payment.paymentUrl)],
+      [Markup.button.callback('❌ Cancel Order', `cancelorder_${order.id}`), Markup.button.callback('🏠 Home', 'menu_home')]
+    ])
   );
 });
 
@@ -389,7 +420,7 @@ async function renderFreeProducts(ctx) {
 
   const buttons = freeEntries.map(([id, p]) => [Markup.button.callback(`🎁 ${p.name} | FREE`, `viewproduct_${id}`)]);
 
-  await smartReply(ctx, '🎁 *Free Products*\n\n✨ Tap any product to view full details.', navButtons(buttons, telegramId));
+  await smartReply(ctx, '✨ 「 *Free Products* 」\n\n✨ Tap any product to view full details.', navButtons(buttons, telegramId));
 }
 
 // ============ ORDER STATUS ============
@@ -409,7 +440,7 @@ async function renderOrderStatus(ctx) {
     return smartReply(ctx, '📋 Abhi tak koi order nahi hai.', backButton(ctx));
   }
 
-  let msg = '📋 *Order Status*\n\n';
+  let msg = '✨ 「 *Order Status* 」\n\n';
   list.slice(0, 10).forEach(o => {
     const statusEmoji = o.status === 'delivered' ? '✅' : o.status === 'pending' ? '⏳' : o.status === 'failed' ? '❌' : o.status === 'refunded' ? '↩️' : '🔄';
     msg += `${statusEmoji} ${mdEscape(o.productName)} — ₹${o.amount} _(${o.status})_\n`;
@@ -464,7 +495,7 @@ async function renderPaymentHistory(ctx) {
     return smartReply(ctx, '🧾 Koi payment history nahi mili.', backButton(ctx));
   }
 
-  let msg = '🧾 *Payment History*\n\n';
+  let msg = '✨ 「 *Payment History* 」\n\n';
   txns.sort((a, b) => b.createdAt - a.createdAt).slice(0, 10).forEach(t => {
     const emoji = t.type === 'credit' ? '➕' : '➖';
     msg += `${emoji} ₹${t.amount} — ${t.reason} _(${new Date(t.createdAt).toLocaleDateString()})_\n`;
@@ -538,7 +569,7 @@ async function renderPurchases(ctx) {
     .filter(o => o.productId && o.productId !== 'PRO_PLAN' && o.productId !== 'WALLET_TOPUP')
     .map(o => [Markup.button.callback(`✅ ${o.productName} — ₹${o.amount}`, `viewproduct_${o.productId}`)]);
 
-  await smartReply(ctx, '📦 *My Purchases*\n\n✨ Tap to view or re-download:', navButtons(buttons, telegramId));
+  await smartReply(ctx, '✨ 「 *My Purchases* 」\n\n✨ Tap to view or re-download:', navButtons(buttons, telegramId));
 }
 
 // ============ MY REFERRALS (menu action version) ============
@@ -801,29 +832,30 @@ bot.action(/^buy_(.+)$/, async (ctx) => {
 });
 
 async function showOrderSummary(ctx, productId, product, appliedCoupon) {
-  const balance = await fb.getWalletBalance(ctx.from.id);
+  const telegramId = ctx.from.id;
+  const balance = await fb.getWalletBalance(telegramId);
 
   let finalPrice = product.price;
   let couponLine = '';
   if (appliedCoupon) {
     finalPrice = Math.max(0, product.price - appliedCoupon.discount);
-    couponLine = `\n🎟 Coupon "${appliedCoupon.code}" applied: -₹${appliedCoupon.discount}`;
+    couponLine = `\n🎟 Coupon \`${mdEscape(appliedCoupon.code)}\` applied: *-₹${appliedCoupon.discount}*`;
   }
 
   const couponSuffix = appliedCoupon ? `_${appliedCoupon.code}` : '';
 
-  const buttons = [
+  const rows = [
     [Markup.button.callback('💰 Pay via Wallet', `paywallet_${productId}${couponSuffix}`)],
-    [Markup.button.callback('💳 Pay via Zabupi', `payzabupi_${productId}${couponSuffix}`)]
+    [Markup.button.callback('💳 Pay via ZapUPI', `payzabupi_${productId}${couponSuffix}`)]
   ];
   if (!appliedCoupon) {
-    buttons.push([Markup.button.callback('🎟 Apply Coupon', `applycoupon_${productId}`)]);
+    rows.push([Markup.button.callback('🎟 Apply Coupon', `applycoupon_${productId}`)]);
   }
-  buttons.push([Markup.button.callback('👑 Get Free with Pro Plan', 'menu_proplan')]);
+  rows.push([Markup.button.callback('👑 Get Free with Pro Plan', 'menu_proplan')]);
 
-  const text = `🧾 Order Summary\n\n*${product.name}*\nPrice: ₹${product.price}${couponLine}\n\n*Total: ₹${finalPrice}*\nWallet Balance: ₹${balance}\n\nPayment method choose karo:`;
+  const text = `🧾 *Order Summary*\n\n✨ ${mdEscape(product.name)}\nPrice: ₹${product.price}${couponLine}\n\n💎 *Total: ₹${finalPrice}*\n💰 Wallet Balance: ₹${balance}\n\n👇 Payment method choose karo:`;
 
-  await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+  await smartReply(ctx, text, navButtons(rows, telegramId));
 }
 
 bot.action(/^applycoupon_(.+)$/, async (ctx) => {
@@ -935,7 +967,7 @@ bot.action(/^payzabupi_([^_]+)(?:_(.+))?$/, async (ctx) => {
   });
 
   const payment = await zabupi.createPaymentOrder({
-    orderId: order.id,
+    orderId: order.payRef,
     amount: finalPrice,
     userId: telegramId,
     userName: ctx.from.first_name,
@@ -1222,7 +1254,7 @@ bot.on('text', async (ctx) => {
     });
 
     const payment = await zabupi.createPaymentOrder({
-      orderId: order.id,
+      orderId: order.payRef,
       amount,
       userId: ctx.from.id,
       userName: ctx.from.first_name,
@@ -1300,7 +1332,7 @@ async function checkAndProcessOrder(orderId) {
     return { processed: false, reason: 'already_done' };
   }
 
-  const statusCheck = await zabupi.checkPaymentStatus(orderId);
+  const statusCheck = await zabupi.checkPaymentStatus(order.payRef || orderId);
   const statusData = statusCheck?.data || statusCheck;
   const status = statusData ? String(statusData.status).toLowerCase() : null;
 
@@ -1391,10 +1423,13 @@ setInterval(async () => {
 
 app.post('/webhook/zabupi', async (req, res) => {
   try {
-    const orderId = req.body.order_id;
-    if (!orderId) return res.status(400).send('Missing order_id');
+    const payRef = req.body.order_id;
+    if (!payRef) return res.status(400).send('Missing order_id');
 
-    await checkAndProcessOrder(orderId);
+    const order = await fb.getOrderByPayRef(payRef);
+    if (!order) return res.status(404).send('Order not found');
+
+    await checkAndProcessOrder(order.id);
     res.status(200).send('OK');
   } catch (err) {
     console.error('Webhook error:', err);
