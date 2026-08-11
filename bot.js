@@ -78,6 +78,36 @@ function navButtons(extraRows, telegramId) {
   return Markup.inlineKeyboard(extraRows ? [...extraRows, row] : [row]);
 }
 
+// ============ SEEN TRACKING (runs first, before any middleware that might
+// short-circuit the request) ============
+// Marks any pending DM/broadcast as "seen" whenever the user sends any
+// update to the bot at all — this is the closest proxy Telegram's Bot API
+// allows for read-receipts, since bots have no real access to that data.
+
+bot.use(async (ctx, next) => {
+  if (ctx.from) {
+    try {
+      const [dmSnap, bSnap] = await Promise.all([
+        fb.db.ref(`users/${ctx.from.id}/lastUnseenDmId`).once('value'),
+        fb.db.ref(`users/${ctx.from.id}/lastUnseenBroadcastId`).once('value')
+      ]);
+
+      const dmId = dmSnap.val();
+      if (dmId) {
+        await fb.db.ref(`dmQueue/${dmId}`).update({ seen: true, seenAt: Date.now() });
+        await fb.db.ref(`users/${ctx.from.id}/lastUnseenDmId`).remove();
+      }
+
+      const bId = bSnap.val();
+      if (bId) {
+        await fb.db.ref(`broadcastQueue/${bId}/seenCount`).transaction(current => (current || 0) + 1);
+        await fb.db.ref(`users/${ctx.from.id}/lastUnseenBroadcastId`).remove();
+      }
+    } catch (e) { /* non-critical — never block the actual request */ }
+  }
+  return next();
+});
+
 // ============ BAN CHECK MIDDLEWARE ============
 
 bot.use(async (ctx, next) => {
@@ -1496,16 +1526,73 @@ app.post('/webhook/zabupi', async (req, res) => {
   }
 });
 
+// Premium auto-redirect landing pages. These are OUR pages — if ZapUPI ever
+// starts honoring a redirect field, or if you link users here manually,
+// this sends them straight back into the bot instead of leaving them
+// stranded on a static confirmation page.
+function redirectPage({ icon, title, message, autoRedirect = true }) {
+  return `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${title}</title>
+<style>
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{
+    background:#0d1117; color:#e6edf3; font-family:'Segoe UI', system-ui, sans-serif;
+    min-height:100vh; display:flex; align-items:center; justify-content:center; text-align:center; padding:24px;
+  }
+  .card{ max-width:380px; }
+  .icon{ font-size:64px; margin-bottom:20px; }
+  h1{ font-size:22px; margin-bottom:12px; }
+  p{ color:#7d8b9a; font-size:14px; line-height:1.6; margin-bottom:28px; }
+  a.btn{
+    display:inline-block; background:#5eead4; color:#04120f; text-decoration:none;
+    padding:14px 32px; border-radius:8px; font-weight:700; font-size:15px;
+  }
+  .spinner{ width:20px; height:20px; border:3px solid #232b36; border-top-color:#5eead4; border-radius:50%; margin:0 auto 16px; animation:spin 0.8s linear infinite; }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">${icon}</div>
+    <h1>${title}</h1>
+    <p>${message}</p>
+    ${autoRedirect ? '<div class="spinner"></div><p style="margin-top:-20px; font-size:12px;">Redirecting to Telegram...</p>' : ''}
+    <a class="btn" href="tg://resolve?domain=${process.env.BOT_USERNAME || ''}" id="openBot">Open Bot</a>
+  </div>
+  <script>
+    const botUsername = ${JSON.stringify(process.env.BOT_USERNAME || '')};
+    if (botUsername) {
+      const link = 'https://t.me/' + botUsername;
+      document.getElementById('openBot').href = link;
+      ${autoRedirect ? 'setTimeout(() => { window.location.href = link; }, 1200);' : ''}
+    }
+  </script>
+</body></html>`;
+}
+
 app.get('/payment-success', (req, res) => {
-  res.send('<h2>Payment received! You can return to Telegram now. ✅</h2>');
+  res.send(redirectPage({
+    icon: '✅',
+    title: 'Payment Received!',
+    message: 'Your payment is being confirmed. Your product will be delivered in the bot within a few seconds.'
+  }));
 });
 
 app.get('/payment-failed', (req, res) => {
-  res.send('<h2>Payment failed. Please return to Telegram and try again. ❌</h2>');
+  res.send(redirectPage({
+    icon: '❌',
+    title: 'Payment Failed',
+    message: 'Something went wrong with your payment. Please return to the bot and try again.'
+  }));
 });
 
 app.get('/payment-timeout', (req, res) => {
-  res.send('<h2>Payment timed out. Please return to Telegram and try again. ⏱️</h2>');
+  res.send(redirectPage({
+    icon: '⏱️',
+    title: 'Payment Timed Out',
+    message: 'The payment session expired. Please return to the bot and try again.'
+  }));
 });
 
 app.get('/', (req, res) => res.send('Bot server running ✅'));
@@ -1561,20 +1648,6 @@ fb.db.ref('broadcastQueue').on('child_added', async (snap) => {
     seenCount: 0
   });
   console.log(`📢 Broadcast sent to ${successCount}/${userIds.length} users`);
-});
-
-// Marks a broadcast as "seen" whenever the recipient interacts with the bot again
-bot.use(async (ctx, next) => {
-  if (ctx.from) {
-    fb.db.ref(`users/${ctx.from.id}/lastUnseenBroadcastId`).once('value', async (snap) => {
-      const bId = snap.val();
-      if (bId) {
-        await fb.db.ref(`broadcastQueue/${bId}/seenCount`).transaction(current => (current || 0) + 1);
-        await fb.db.ref(`users/${ctx.from.id}/lastUnseenBroadcastId`).remove();
-      }
-    }).catch(() => {});
-  }
-  return next();
 });
 
 // ============ INDIVIDUAL DM LISTENER (from admin panel) ============
@@ -1660,20 +1733,6 @@ fb.db.ref('dmQueue').on('child_added', async (snap) => {
 bot.action('closepopup', async (ctx) => {
   await ctx.answerCbQuery();
   try { await ctx.deleteMessage(); } catch (e) {}
-});
-
-// Marks any pending DM as "seen" whenever the user interacts with the bot again
-bot.use(async (ctx, next) => {
-  if (ctx.from) {
-    fb.db.ref(`users/${ctx.from.id}/lastUnseenDmId`).once('value', async (snap) => {
-      const dmId = snap.val();
-      if (dmId) {
-        await fb.db.ref(`dmQueue/${dmId}`).update({ seen: true, seenAt: Date.now() });
-        await fb.db.ref(`users/${ctx.from.id}/lastUnseenDmId`).remove();
-      }
-    }).catch(() => {});
-  }
-  return next();
 });
 
 // ============ START SERVERS ============
