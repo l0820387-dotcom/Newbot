@@ -293,7 +293,6 @@ async function createOrder(orderData) {
   await orderRef.set(order);
   return order;
 }
-
 async function updateOrderStatus(orderId, status, extra = {}) {
   await db.ref(`orders/${orderId}`).update({ status, ...extra });
 }

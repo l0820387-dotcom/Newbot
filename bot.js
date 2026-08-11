@@ -30,8 +30,10 @@ async function smartReply(ctx, text, extra = {}) {
 
   if (ctx.callbackQuery) {
     try {
-      await ctx.editMessageText(text, payload);
-      return;
+      const edited = await ctx.editMessageText(text, payload);
+      // editMessageText returns `true` for inline messages or the message
+      // object for regular ones — normalize to the original message.
+      return typeof edited === 'object' ? edited : ctx.callbackQuery.message;
     } catch (err) {
       // Can't edit (likely a photo message, or a Markdown parse error) —
       // clean up instead of stacking messages
@@ -42,9 +44,9 @@ async function smartReply(ctx, text, extra = {}) {
   // Guaranteed to run if edit wasn't possible. If Markdown parsing itself is
   // the problem, retry once as plain text so the user always sees *something*.
   try {
-    await ctx.reply(text, payload);
+    return await ctx.reply(text, payload);
   } catch (err) {
-    await ctx.reply(text, { ...extra, parse_mode: undefined });
+    return await ctx.reply(text, { ...extra, parse_mode: undefined });
   }
 }
 
@@ -443,7 +445,9 @@ async function renderOrderStatus(ctx) {
   let msg = '✨ 「 *Order Status* 」\n\n';
   list.slice(0, 10).forEach(o => {
     const statusEmoji = o.status === 'delivered' ? '✅' : o.status === 'pending' ? '⏳' : o.status === 'failed' ? '❌' : o.status === 'refunded' ? '↩️' : '🔄';
-    msg += `${statusEmoji} ${mdEscape(o.productName)} — ₹${o.amount} _(${o.status})_\n`;
+    const statusLabel = o.status.charAt(0).toUpperCase() + o.status.slice(1);
+    const dateStr = o.createdAt ? new Date(o.createdAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }) : '';
+    msg += `${statusEmoji} *${mdEscape(o.productName)}*\n💰 ₹${o.amount} · _${statusLabel}_ · ${dateStr}\n\n`;
   });
 
   const refundable = list.find(o => o.status === 'delivered' && !o.refundStatus && o.productId !== 'PRO_PLAN' && o.productId !== 'WALLET_TOPUP');
@@ -452,7 +456,7 @@ async function renderOrderStatus(ctx) {
     buttons.push([Markup.button.callback('↩️ Request Refund', `refund_${refundable.id}`)]);
   }
 
-  await smartReply(ctx, msg, navButtons(buttons, telegramId));
+  await smartReply(ctx, msg.trim(), navButtons(buttons, telegramId));
 }
 
 // ============ MY STATS ============
@@ -485,23 +489,40 @@ bot.action('menu_paymenthistory', async (ctx) => {
 });
 
 async function renderPaymentHistory(ctx) {
+  const telegramId = ctx.from.id;
+  const orders = await fb.getUserOrders(telegramId);
+  const paidOrders = Object.values(orders).filter(o => o.status === 'paid' || o.status === 'delivered');
+
   const txns = await new Promise((resolve) => {
-    fb.db.ref('walletTransactions').orderByChild('userId').equalTo(String(ctx.from.id)).once('value', snap => {
+    fb.db.ref('walletTransactions').orderByChild('userId').equalTo(String(telegramId)).once('value', snap => {
       resolve(snap.exists() ? Object.values(snap.val()) : []);
     });
   });
 
-  if (txns.length === 0) {
+  // Merge orders (ZapUPI + wallet purchases) and raw wallet transactions
+  // (top-ups, referral bonuses, refunds) into one timeline.
+  const entries = [
+    ...paidOrders.map(o => ({
+      createdAt: o.createdAt,
+      label: `${o.paymentMethod === 'wallet' ? '💰' : '💳'} ${mdEscape(o.productName)} — ₹${o.amount}`
+    })),
+    ...txns.map(t => ({
+      createdAt: t.createdAt,
+      label: `${t.type === 'credit' ? '➕' : '➖'} ₹${t.amount} — ${t.reason}`
+    }))
+  ];
+
+  if (entries.length === 0) {
     return smartReply(ctx, '🧾 Koi payment history nahi mili.', backButton(ctx));
   }
 
   let msg = '✨ 「 *Payment History* 」\n\n';
-  txns.sort((a, b) => b.createdAt - a.createdAt).slice(0, 10).forEach(t => {
-    const emoji = t.type === 'credit' ? '➕' : '➖';
-    msg += `${emoji} ₹${t.amount} — ${t.reason} _(${new Date(t.createdAt).toLocaleDateString()})_\n`;
+  entries.sort((a, b) => b.createdAt - a.createdAt).slice(0, 15).forEach(e => {
+    const dateStr = new Date(e.createdAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+    msg += `${e.label}\n_${dateStr}_\n\n`;
   });
 
-  await smartReply(ctx, msg, backButton(ctx));
+  await smartReply(ctx, msg.trim(), backButton(ctx));
 }
 
 // ============ LANGUAGE ============
@@ -533,7 +554,7 @@ async function renderSupport(ctx) {
 
   if (settings.supportTelegram) {
     const handle = settings.supportTelegram.replace('@', '');
-    msg += `💬 Telegram: @${handle}\n`;
+    msg += `💬 Telegram: @${mdEscape(handle)}\n`;
     buttons.push([Markup.button.url('💬 Message on Telegram', `https://t.me/${handle}`)]);
   }
   if (settings.supportWhatsapp) {
@@ -586,6 +607,10 @@ async function sendReferralInfo(ctx) {
   const settings = await fb.getReferralSettings();
   const botInfo = await bot.telegram.getMe();
 
+  const allUsers = await fb.getAllUsers();
+  const referredUsers = Object.values(allUsers).filter(u => u.referredBy === String(telegramId));
+  const convertedCount = referredUsers.filter(u => u.hasFirstPurchase).length;
+
   const link = `https://t.me/${botInfo.username}?start=${user.referralCode}`;
   const bonusText = settings.bonusType === 'percent'
     ? `${settings.bonusAmount}% of their first purchase`
@@ -593,7 +618,7 @@ async function sendReferralInfo(ctx) {
 
   await smartReply(
     ctx,
-    `🔗 *My Referrals*\n\n💎 Apne friends ko invite karo aur unki pehli purchase pe *${bonusText}* wallet bonus paao!\n\n🔗 Your referral link:\n\`${link}\``,
+    `✨ 「 *My Referrals* 」\n\n💎 Apne friends ko invite karo aur unki pehli purchase pe *${bonusText}* wallet bonus paao!\n\n👥 Total Referred: *${referredUsers.length}*\n✅ Converted (purchased): *${convertedCount}*\n\n🔗 Your referral link:\n\`${link}\``,
     backButton(ctx)
   );
 }
@@ -662,7 +687,8 @@ bot.action(/^viewproduct_(.+)$/, async (ctx) => {
   const product = await fb.getProduct(productId);
 
   if (!product) {
-    return ctx.answerCbQuery('Product not found.');
+    await ctx.answerCbQuery('⚠️ Yeh product ab available nahi hai.', { show_alert: true });
+    return smartReply(ctx, '⚠️ Yeh product remove kar diya gaya hai. Aapka purchase record safe hai — Order Status mein check kar sakte ho.', backButton(ctx));
   }
 
   await ctx.answerCbQuery();
@@ -986,14 +1012,24 @@ bot.action(/^payzabupi_([^_]+)(?:_(.+))?$/, async (ctx) => {
 
   await fb.updateOrderStatus(order.id, 'pending', { zabupiTxnId: payment.transactionId });
 
-  await smartReply(
+  const sentMsg = await smartReply(
     ctx,
-    `💳 *Payment link ready!*\n\n${mdEscape(product.name)} — ₹${finalPrice}\n\nNeeche link pe click karke payment complete karo. Payment hote hi product turant deliver ho jaayega ✅`,
+    `💳 *Payment link ready!*\n\n${mdEscape(product.name)} — ₹${finalPrice}\n\n👇 Neeche link pe click karke payment complete karo.\n\n✅ Payment hote hi (10-20 sec mein) product yahin turant deliver ho jaayega — payment ke baad browser tab band karke seedha Telegram pe wapas aa jao.`,
     Markup.inlineKeyboard([
       [Markup.button.url('💳 Pay Now', payment.paymentUrl)],
       [Markup.button.callback('❌ Cancel Order', `cancelorder_${order.id}`), Markup.button.callback('🏠 Home', 'menu_home')]
     ])
   );
+
+  // Save this message's location so the background payment poller can edit
+  // it directly into a success message once payment completes — instead of
+  // leaving the "Pay Now" screen stuck in the chat.
+  if (sentMsg) {
+    await fb.updateOrderStatus(order.id, 'pending', {
+      paymentMsgChatId: sentMsg.chat.id,
+      paymentMsgId: sentMsg.message_id
+    });
+  }
 });
 
 // ---- Cancel a pending order ----
@@ -1347,10 +1383,15 @@ async function checkAndProcessOrder(orderId) {
   const transaction_id = statusData.txn_id || null;
   await fb.updateOrderStatus(orderId, 'paid', { zabupiTxnId: transaction_id });
 
+  // Turn the "Pay Now / Cancel" message into a clean success confirmation —
+  // removes the buttons so the user can't tap a stale Pay Now / Cancel after
+  // payment already went through.
+  await replacePaymentMessage(order, `✅ *Payment Successful!*\n\n💎 ${mdEscape(order.productName)} — ₹${order.amount}\n\nDelivering now...`);
+
   // Wallet top-up
   if (order.productId === 'WALLET_TOPUP' || order.isWalletTopup) {
     await fb.creditWallet(order.userId, order.amount, 'topup');
-    await bot.telegram.sendMessage(order.userId, `✅ ₹${order.amount} added to your wallet!`);
+    await bot.telegram.sendMessage(order.userId, `✅ *₹${order.amount} added to your wallet!*\n\n💰 Naya balance check karne ke liye Wallet mein jao.`, { parse_mode: 'Markdown' });
     await fb.updateOrderStatus(orderId, 'delivered', { deliveredAt: Date.now() });
     return { processed: true, reason: 'topup_done' };
   }
@@ -1361,7 +1402,7 @@ async function checkAndProcessOrder(orderId) {
     const newExpiry = await fb.activateProPlan(order.userId, duration);
     await bot.telegram.sendMessage(
       order.userId,
-      `👑 *Pro Plan Activated!*\n\nAap ab VIP hain — sab paid products FREE mein download kar sakte ho.\n\nExpires: ${new Date(newExpiry).toLocaleDateString()}`,
+      `👑 *Pro Plan Activated!*\n\n✨ Aap ab VIP hain — sab paid products FREE mein download kar sakte ho.\n\n📅 Expires: ${new Date(newExpiry).toLocaleDateString()}`,
       { parse_mode: 'Markdown' }
     );
     await fb.updateOrderStatus(orderId, 'delivered', { deliveredAt: Date.now() });
@@ -1379,12 +1420,13 @@ async function checkAndProcessOrder(orderId) {
     try {
       if (product.deliveryType === 'file' && product.fileId) {
         await bot.telegram.sendDocument(order.userId, product.fileId, {
-          caption: `📦 ${product.name}\n\nThank you for your purchase! 🙏`
+          caption: `📦 *${product.name}*\n\n🙏 Thank you for your purchase!`,
+          parse_mode: 'Markdown'
         });
       } else if (product.deliveryType === 'link' && product.deliveryLink) {
         await bot.telegram.sendMessage(
           order.userId,
-          `✅ Payment successful!\n\n📦 *${product.name}*\n\n🔗 Download Link:\n${product.deliveryLink}\n\nThank you! 🙏`,
+          `✅ *Payment successful!*\n\n📦 ${mdEscape(product.name)}\n\n🔗 Download Link:\n${product.deliveryLink}\n\n🙏 Thank you!`,
           { parse_mode: 'Markdown' }
         );
       }
@@ -1395,6 +1437,23 @@ async function checkAndProcessOrder(orderId) {
   }
 
   return { processed: true, reason: 'delivered' };
+}
+
+// Edits the original "Pay Now / Cancel" message (tracked via
+// paymentMsgChatId/paymentMsgId) into a clean confirmation with no buttons.
+// Falls back to a fresh message if the original can't be edited/found.
+async function replacePaymentMessage(order, text) {
+  if (order.paymentMsgChatId && order.paymentMsgId) {
+    try {
+      await bot.telegram.editMessageText(order.paymentMsgChatId, order.paymentMsgId, undefined, text, { parse_mode: 'Markdown' });
+      return;
+    } catch (err) {
+      // message too old / already changed — fall through to a fresh message
+    }
+  }
+  try {
+    await bot.telegram.sendMessage(order.userId, text, { parse_mode: 'Markdown' });
+  } catch (err) { /* user may have blocked the bot */ }
 }
 
 // ---- Polling loop: ZapUPI's documented create-order payload has no
@@ -1462,44 +1521,159 @@ fb.db.ref('broadcastQueue').on('child_added', async (snap) => {
   const users = await fb.getAllUsers();
   const userIds = Object.keys(users);
 
-  const extra = { parse_mode: 'Markdown' };
+  const inlineKeyboard = [];
   if (data.buttonText && data.buttonUrl) {
-    extra.reply_markup = { inline_keyboard: [[{ text: data.buttonText, url: data.buttonUrl }]] };
+    inlineKeyboard.push([{ text: data.buttonText, url: data.buttonUrl }]);
   }
+  if (data.isPopup) {
+    inlineKeyboard.push([{ text: '❌ Close', callback_data: 'closepopup' }]);
+  }
+  const extra = { parse_mode: 'Markdown' };
+  if (inlineKeyboard.length > 0) extra.reply_markup = { inline_keyboard: inlineKeyboard };
+
+  const prefix = data.isPopup ? '🔔 *Notification*' : '📢 *Announcement*';
+  const fileIds = Array.isArray(data.fileIds) ? data.fileIds : [];
 
   let successCount = 0;
+  const deliveredTo = [];
   for (const uid of userIds) {
     try {
-      await bot.telegram.sendMessage(uid, `📢 *Announcement*\n\n${data.message}`, extra);
+      await bot.telegram.sendMessage(uid, `${prefix}\n\n${data.message}`, extra);
+      for (const fid of fileIds) {
+        try { await bot.telegram.sendDocument(uid, fid); } catch (e) { /* skip broken file_id */ }
+      }
       successCount++;
+      deliveredTo.push(uid);
+      // Mark this broadcast as this user's "latest unseen" — same proxy
+      // pattern as DMs, since Bot API gives no real read-receipt access.
+      await fb.db.ref(`users/${uid}/lastUnseenBroadcastId`).set(snap.key);
     } catch (e) {
       // user may have blocked the bot — skip silently
     }
     await new Promise(r => setTimeout(r, 50)); // avoid hitting Telegram rate limits
   }
 
-  await snap.ref.update({ sent: true, sentAt: Date.now(), sentCount: successCount });
+  await snap.ref.update({
+    sent: true,
+    sentAt: Date.now(),
+    sentCount: successCount,
+    targetCount: userIds.length,
+    seenCount: 0
+  });
   console.log(`📢 Broadcast sent to ${successCount}/${userIds.length} users`);
+});
+
+// Marks a broadcast as "seen" whenever the recipient interacts with the bot again
+bot.use(async (ctx, next) => {
+  if (ctx.from) {
+    fb.db.ref(`users/${ctx.from.id}/lastUnseenBroadcastId`).once('value', async (snap) => {
+      const bId = snap.val();
+      if (bId) {
+        await fb.db.ref(`broadcastQueue/${bId}/seenCount`).transaction(current => (current || 0) + 1);
+        await fb.db.ref(`users/${ctx.from.id}/lastUnseenBroadcastId`).remove();
+      }
+    }).catch(() => {});
+  }
+  return next();
 });
 
 // ============ INDIVIDUAL DM LISTENER (from admin panel) ============
 // Admin panel writes to dmQueue/{id} with { userId, message, sent:false, buttonText?, buttonUrl? }
+// This queue itself doubles as message history — the admin panel reads it directly.
+
+// ============ NEW PRODUCT NOTIFICATION ============
+// Automatically notifies all users when admin adds a new active product.
+// Skips products created before the bot started (avoids a notification
+// storm on first deploy) via the `notifiedNewProduct` marker.
+
+fb.db.ref('products').on('child_added', async (snap) => {
+  const product = snap.val();
+  if (!product || !product.active || product.notifiedNewProduct) return;
+
+  // Only notify for products created in the last 2 minutes — protects
+  // against re-notifying on bot restart for older products.
+  if (!product.createdAt || Date.now() - product.createdAt > 2 * 60 * 1000) return;
+
+  await snap.ref.update({ notifiedNewProduct: true });
+
+  const users = await fb.getAllUsers();
+  const userIds = Object.keys(users);
+  const priceLabel = product.price === 0 ? 'FREE 🎁' : `₹${product.price}`;
+
+  for (const uid of userIds) {
+    try {
+      await bot.telegram.sendMessage(
+        uid,
+        `🆕 *New Product Added!*\n\n✨ ${mdEscape(product.name)}\n💰 ${priceLabel}\n\n${mdEscape(product.description || '')}`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: { inline_keyboard: [[{ text: '👀 View Product', callback_data: `viewproduct_${snap.key}` }]] }
+        }
+      );
+    } catch (e) { /* user blocked bot — skip */ }
+    await new Promise(r => setTimeout(r, 50));
+  }
+  console.log(`🆕 New product notification sent for "${product.name}"`);
+});
 
 fb.db.ref('dmQueue').on('child_added', async (snap) => {
   const data = snap.val();
   if (!data || data.sent || !data.userId || !data.message) return;
 
-  const extra = { parse_mode: 'Markdown' };
+  const inlineKeyboard = [];
   if (data.buttonText && data.buttonUrl) {
-    extra.reply_markup = { inline_keyboard: [[{ text: data.buttonText, url: data.buttonUrl }]] };
+    inlineKeyboard.push([{ text: data.buttonText, url: data.buttonUrl }]);
+  }
+  if (data.isPopup) {
+    inlineKeyboard.push([{ text: '❌ Close', callback_data: 'closepopup' }]);
   }
 
+  const extra = { parse_mode: 'Markdown' };
+  if (inlineKeyboard.length > 0) extra.reply_markup = { inline_keyboard: inlineKeyboard };
+
   try {
-    await bot.telegram.sendMessage(data.userId, `📩 *Message from Admin:*\n\n${data.message}`, extra);
+    const prefix = data.isPopup ? '🔔 *Notification*' : '📩 *Message from Admin:*';
+    const fileIds = Array.isArray(data.fileIds) ? data.fileIds : [];
+
+    if (fileIds.length > 0) {
+      // Send the message text first, then each attached file
+      await bot.telegram.sendMessage(data.userId, `${prefix}\n\n${data.message}`, extra);
+      for (const fid of fileIds) {
+        try { await bot.telegram.sendDocument(data.userId, fid); } catch (e) { /* skip broken file_id */ }
+      }
+    } else {
+      await bot.telegram.sendMessage(data.userId, `${prefix}\n\n${data.message}`, extra);
+    }
+
     await snap.ref.update({ sent: true, sentAt: Date.now(), success: true });
+    // Mark this as the user's "latest unseen DM" — cleared to seen=true the
+    // next time they interact with the bot at all. Telegram's Bot API has no
+    // true read-receipt access, so "seen" here means "was active in the bot
+    // after this was delivered" — the closest reliable proxy available.
+    await fb.db.ref(`users/${data.userId}/lastUnseenDmId`).set(snap.key);
   } catch (err) {
     await snap.ref.update({ sent: true, sentAt: Date.now(), success: false, error: err.message });
   }
+});
+
+// Closes a popup-style message by deleting it
+bot.action('closepopup', async (ctx) => {
+  await ctx.answerCbQuery();
+  try { await ctx.deleteMessage(); } catch (e) {}
+});
+
+// Marks any pending DM as "seen" whenever the user interacts with the bot again
+bot.use(async (ctx, next) => {
+  if (ctx.from) {
+    fb.db.ref(`users/${ctx.from.id}/lastUnseenDmId`).once('value', async (snap) => {
+      const dmId = snap.val();
+      if (dmId) {
+        await fb.db.ref(`dmQueue/${dmId}`).update({ seen: true, seenAt: Date.now() });
+        await fb.db.ref(`users/${ctx.from.id}/lastUnseenDmId`).remove();
+      }
+    }).catch(() => {});
+  }
+  return next();
 });
 
 // ============ START SERVERS ============
