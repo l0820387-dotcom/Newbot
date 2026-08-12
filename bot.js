@@ -155,6 +155,12 @@ bot.use(async (ctx, next) => {
 
   const notJoined = await getUnjoinedChannels(ctx.from.id, requiredChannels);
   if (notJoined.length > 0) {
+    // If they arrived via a deep-link (e.g. a shared product URL), remember
+    // it so we can send them there after they finish joining, instead of
+    // dropping them on the generic main menu.
+    if (ctx.startPayload) {
+      await fb.db.ref(`users/${ctx.from.id}/pendingDeepLink`).set(ctx.startPayload);
+    }
     await sendJoinPrompt(ctx, notJoined);
     return; // block everything else
   }
@@ -206,6 +212,24 @@ bot.action('check_joined', async (ctx) => {
     await ctx.answerCbQuery('✅ Verified!');
     const telegramId = ctx.from.id;
     await fb.createUserIfNotExists(telegramId, ctx.from, null);
+
+    // If they arrived via a product deep-link before joining, send them
+    // straight to that product now instead of the generic main menu.
+    const pendingSnap = await fb.db.ref(`users/${telegramId}/pendingDeepLink`).once('value');
+    const pendingPayload = pendingSnap.val();
+    if (pendingPayload) {
+      await fb.db.ref(`users/${telegramId}/pendingDeepLink`).remove();
+      if (pendingPayload.startsWith('PROD_')) {
+        const productId = pendingPayload.slice('PROD_'.length);
+        const product = await fb.getProduct(productId);
+        if (product) {
+          await fb.incrementProductViews(productId);
+          pushNav(telegramId, `viewproduct_${productId}`);
+          return sendProductCard(ctx, productId, product);
+        }
+      }
+    }
+
     await sendMainMenu(ctx);
   } else {
     await ctx.answerCbQuery('❌ Abhi bhi kuch channels join nahi kiye.', { show_alert: true });
@@ -216,9 +240,24 @@ bot.action('check_joined', async (ctx) => {
 
 bot.start(async (ctx) => {
   const telegramId = ctx.from.id;
-  const payload = ctx.startPayload; // referral code if /start?start=REF123456
+  const payload = ctx.startPayload; // e.g. REF123456 (referral) or PROD_<productId> (direct product link)
 
-  await fb.createUserIfNotExists(telegramId, ctx.from, payload);
+  const isProductLink = payload && payload.startsWith('PROD_');
+  const referralCode = isProductLink ? null : payload;
+
+  await fb.createUserIfNotExists(telegramId, ctx.from, referralCode);
+
+  if (isProductLink) {
+    const productId = payload.slice('PROD_'.length);
+    const product = await fb.getProduct(productId);
+    if (product) {
+      await fb.incrementProductViews(productId);
+      pushNav(telegramId, `viewproduct_${productId}`);
+      return sendProductCard(ctx, productId, product);
+    }
+    // Product not found (deleted/invalid link) — fall through to normal menu
+  }
+
   await sendMainMenu(ctx);
 });
 
@@ -1349,6 +1388,16 @@ bot.on('document', async (ctx) => {
   await ctx.reply(`📎 File ID:\n\`${ctx.message.document.file_id}\`\n\nAdmin panel mein product add karte waqt yeh paste karo.`, { parse_mode: 'Markdown' });
 });
 
+// Utility: send a photo to get its file_id (for broadcast/DM image attachments)
+bot.on('photo', async (ctx) => {
+  if (!fb.isAdmin(ctx.from.id)) return;
+  // Telegram sends multiple sizes of the same photo — the last one is the
+  // largest/original resolution, which is what you want for sending back out.
+  const sizes = ctx.message.photo;
+  const largest = sizes[sizes.length - 1];
+  await ctx.reply(`🖼 Photo File ID:\n\`${largest.file_id}\`\n\nAdmin panel mein broadcast/DM "Attach Images" field mein yeh paste karo.`, { parse_mode: 'Markdown' });
+});
+
 // ============ TEXT HANDLER (for multi-step states) ============
 
 bot.on('text', async (ctx) => {
@@ -1742,20 +1791,24 @@ fb.db.ref('broadcastQueue').on('child_added', async (snap) => {
 
   let successCount = 0;
   const deliveredTo = [];
+  const sentMessages = {}; // { userId: { chatId, messageId } } — needed to unsend later
+
   for (const uid of userIds) {
     try {
+      let sentMsg;
       if (imageIds.length > 0) {
         // First image carries the text as its caption; rest are sent bare
-        await bot.telegram.sendPhoto(uid, imageIds[0], { caption: `${prefix}\n\n${data.message}`, ...extra });
+        sentMsg = await bot.telegram.sendPhoto(uid, imageIds[0], { caption: `${prefix}\n\n${data.message}`, ...extra });
         for (const imgId of imageIds.slice(1)) {
           try { await bot.telegram.sendPhoto(uid, imgId); } catch (e) { /* skip broken file_id */ }
         }
       } else {
-        await bot.telegram.sendMessage(uid, `${prefix}\n\n${data.message}`, extra);
+        sentMsg = await bot.telegram.sendMessage(uid, `${prefix}\n\n${data.message}`, extra);
       }
       for (const fid of fileIds) {
         try { await bot.telegram.sendDocument(uid, fid); } catch (e) { /* skip broken file_id */ }
       }
+      sentMessages[uid] = { chatId: sentMsg.chat.id, messageId: sentMsg.message_id };
       successCount++;
       deliveredTo.push(uid);
       // Mark this broadcast as this user's "latest unseen" — same proxy
@@ -1772,9 +1825,39 @@ fb.db.ref('broadcastQueue').on('child_added', async (snap) => {
     sentAt: Date.now(),
     sentCount: successCount,
     targetCount: userIds.length,
-    seenCount: 0
+    seenCount: 0,
+    sentMessages
   });
   console.log(`📢 Broadcast sent to ${successCount}/${userIds.length} users`);
+});
+
+// Admin panel sets deleteRequested:true on a broadcastQueue entry — this
+// unsends the actual Telegram message from every recipient's chat.
+fb.db.ref('broadcastQueue').on('child_changed', async (snap) => {
+  const data = snap.val();
+  if (!data || !data.deleteRequested || data.deleted) return;
+
+  const sentMessages = data.sentMessages || {};
+  const entries = Object.entries(sentMessages);
+
+  if (entries.length === 0) {
+    await snap.ref.update({ deleted: true, deleteError: 'No message references saved' });
+    return;
+  }
+
+  let unsentCount = 0;
+  for (const [uid, ref] of entries) {
+    try {
+      await bot.telegram.deleteMessage(ref.chatId, ref.messageId);
+      unsentCount++;
+    } catch (err) {
+      // message too old (48h+ limit) or already deleted — skip
+    }
+    await new Promise(r => setTimeout(r, 50));
+  }
+
+  await snap.ref.update({ deleted: true, deletedAt: Date.now(), unsentCount });
+  console.log(`🗑️ Broadcast unsent from ${unsentCount}/${entries.length} chats`);
 });
 
 // ============ INDIVIDUAL DM LISTENER (from admin panel) ============
@@ -1874,16 +1957,25 @@ bot.action('closepopup', async (ctx) => {
 fb.db.ref('dmQueue').on('child_changed', async (snap) => {
   const data = snap.val();
   if (!data || !data.deleteRequested || data.deleted) return;
+
+  // Claim this delete request atomically so a duplicate/late-firing event
+  // (Firebase can re-fire child_changed) never tries to delete twice.
+  const claim = await snap.ref.child('deleted').transaction(current => {
+    if (current === true) return; // already claimed — abort
+    return true;
+  });
+  if (!claim.committed) return;
+
   if (!data.sentChatId || !data.sentMessageId) {
-    await snap.ref.update({ deleted: true, deleteError: 'No message reference saved' });
+    await snap.ref.update({ deleteError: 'No message reference saved' });
     return;
   }
   try {
     await bot.telegram.deleteMessage(data.sentChatId, data.sentMessageId);
-    await snap.ref.update({ deleted: true, deletedAt: Date.now() });
+    await snap.ref.update({ deletedAt: Date.now() });
   } catch (err) {
     // Telegram only allows deleting messages within 48 hours
-    await snap.ref.update({ deleted: true, deleteError: err.message });
+    await snap.ref.update({ deleteError: err.message });
   }
 });
 
