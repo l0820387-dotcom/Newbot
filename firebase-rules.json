@@ -41,6 +41,10 @@
       ".read": "auth != null",
       ".write": "auth != null"
     },
+    "checkInSettings": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
     "reviews": {
       ".read": "auth != null",
       ".write": "auth != null"

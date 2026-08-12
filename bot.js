@@ -242,7 +242,9 @@ const DEFAULT_MENU_LABELS = {
   stats: '📊 My Stats',
   paymenthistory: '🧾 Payment History',
   support: '📞 Support',
-  language: '🌐 Hindi / English'
+  language: '🌐 Hindi / English',
+  checkin: '🎯 Daily Check-in',
+  leaderboard: '🏆 Leaderboard'
 };
 
 function mainMenu(settings) {
@@ -255,6 +257,7 @@ function mainMenu(settings) {
     [Markup.button.callback(labels.proplan, 'menu_proplan'), Markup.button.callback(labels.purchases, 'menu_purchases')],
     [Markup.button.callback(labels.orders, 'menu_orders'), Markup.button.callback(labels.referrals, 'menu_referrals')],
     [Markup.button.callback(labels.stats, 'menu_stats'), Markup.button.callback(labels.paymenthistory, 'menu_paymenthistory')],
+    [Markup.button.callback(labels.checkin, 'menu_checkin'), Markup.button.callback(labels.leaderboard, 'menu_leaderboard')],
     [Markup.button.callback(labels.support, 'menu_support'), Markup.button.callback(labels.language, 'menu_language')]
   ];
 
@@ -351,7 +354,9 @@ bot.action('nav_back', async (ctx) => {
     menu_stats: () => renderStats(ctx),
     menu_paymenthistory: () => renderPaymentHistory(ctx),
     menu_support: () => renderSupport(ctx),
-    menu_language: () => renderLanguage(ctx)
+    menu_language: () => renderLanguage(ctx),
+    menu_checkin: () => renderCheckIn(ctx),
+    menu_leaderboard: () => renderLeaderboard(ctx)
   };
 
   const renderer = screenRenderers[target];
@@ -567,6 +572,82 @@ async function renderLanguage(ctx) {
   await smartReply(ctx, '🌐 Abhi sirf Hinglish support hai.\n\n✨ Full Hindi/English switch jaldi aa raha hai! 🙏', backButton(ctx));
 }
 
+// ============ DAILY CHECK-IN ============
+
+bot.action('menu_checkin', async (ctx) => {
+  await ctx.answerCbQuery();
+  pushNav(ctx.from.id, 'menu_checkin');
+  await renderCheckIn(ctx);
+});
+
+async function renderCheckIn(ctx) {
+  const telegramId = ctx.from.id;
+  const settings = await fb.getCheckInSettings();
+
+  if (!settings.active) {
+    return smartReply(ctx, '🎯 Daily Check-in abhi available nahi hai.', backButton(ctx));
+  }
+
+  const result = await fb.performCheckIn(telegramId);
+
+  if (!result.success && result.reason === 'already_checked_in') {
+    return smartReply(
+      ctx,
+      `✅ *Aaj already check-in kar chuke ho!*\n\n🔥 Current Streak: *${result.streak} din*\n\nKal wapas aana aur streak jaari rakhna! ⏰`,
+      backButton(ctx)
+    );
+  }
+
+  if (!result.success) {
+    return smartReply(ctx, '⚠️ Check-in abhi available nahi hai.', backButton(ctx));
+  }
+
+  await smartReply(
+    ctx,
+    `🎯 *Daily Check-in Successful!*\n\n💰 +₹${result.bonus} wallet mein add ho gaya\n🔥 Streak: *${result.streak} din*\n\n✨ Roz check-in karke streak badhao aur zyada bonus paao!`,
+    backButton(ctx)
+  );
+}
+
+// ============ LEADERBOARD ============
+
+bot.action('menu_leaderboard', async (ctx) => {
+  await ctx.answerCbQuery();
+  pushNav(ctx.from.id, 'menu_leaderboard');
+  await renderLeaderboard(ctx);
+});
+
+async function renderLeaderboard(ctx) {
+  const [topBuyers, topReferrers] = await Promise.all([
+    fb.getTopBuyers(5),
+    fb.getTopReferrers(5)
+  ]);
+
+  let msg = '🏆 「 *Leaderboard* 」\n\n';
+
+  msg += '💰 *Top Buyers*\n';
+  if (topBuyers.length === 0) {
+    msg += '_Koi purchase abhi nahi hui_\n';
+  } else {
+    const medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'];
+    topBuyers.forEach((b, i) => {
+      msg += `${medals[i]} ${mdEscape(b.name)} — ₹${b.totalSpent}\n`;
+    });
+  }
+
+  msg += '\n🔗 *Top Referrers*\n';
+  if (topReferrers.length === 0) {
+    msg += '_Koi referral abhi nahi hua_\n';
+  } else {
+    const medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'];
+    topReferrers.forEach((r, i) => {
+      msg += `${medals[i]} ${mdEscape(r.name)} — ${r.referralCount} referrals\n`;
+    });
+  }
+
+  await smartReply(ctx, msg.trim(), backButton(ctx));
+}
+
 // ============ SUPPORT (menu action version) ============
 
 bot.action('menu_support', async (ctx) => {
@@ -618,7 +699,7 @@ async function renderPurchases(ctx) {
 
   const buttons = delivered.slice(0, 15)
     .filter(o => o.productId && o.productId !== 'PRO_PLAN' && o.productId !== 'WALLET_TOPUP')
-    .map(o => [Markup.button.callback(`✅ ${o.productName} — ₹${o.amount}`, `viewproduct_${o.productId}`)]);
+    .map(o => [Markup.button.callback(`✅ ${o.productName} — ₹${o.amount}`, `redeliver_${o.id}`)]);
 
   await smartReply(ctx, '✨ 「 *My Purchases* 」\n\n✨ Tap to view or re-download:', navButtons(buttons, telegramId));
 }
@@ -846,15 +927,15 @@ bot.action(/^buy_(.+)$/, async (ctx) => {
   }
 
   // Already bought? Don't let them pay again — offer re-delivery instead.
-  const alreadyBought = await fb.hasUserBoughtProduct(telegramId, productId);
-  if (alreadyBought) {
+  const boughtOrder = await fb.getBoughtOrder(telegramId, productId);
+  if (boughtOrder) {
     await ctx.answerCbQuery();
     return ctx.reply(
-      `✅ Yeh product aap pehle hi khareed chuke ho!\n\n*${product.name}*\n\nDobara download karna hai?`,
+      `✅ Yeh product aap pehle hi khareed chuke ho!\n\n*${mdEscape(product.name)}*\n\nDobara download karna hai?`,
       {
         parse_mode: 'Markdown',
         ...Markup.inlineKeyboard([
-          [Markup.button.callback('📥 Re-download', `redeliver_${productId}`)],
+          [Markup.button.callback('📥 Re-download', `redeliver_${boughtOrder.id}`)],
           [Markup.button.callback('🏠 Home', 'menu_home')]
         ])
       }
@@ -876,7 +957,12 @@ bot.action(/^buy_(.+)$/, async (ctx) => {
       productName: product.name,
       amount: 0,
       originalAmount: product.price,
-      paymentMethod: 'vip_free'
+      paymentMethod: 'vip_free',
+      productSnapshot: {
+        deliveryType: product.deliveryType,
+        fileId: product.fileId || null,
+        deliveryLink: product.deliveryLink || null
+      }
     });
     await fb.updateOrderStatus(order.id, 'paid');
     await fb.decrementStock(productId);
@@ -967,7 +1053,12 @@ bot.action(/^paywallet_([^_]+)(?:_(.+))?$/, async (ctx) => {
       amount: finalPrice,
       originalAmount: product.price,
       couponUsed: couponUsed || null,
-      paymentMethod: 'wallet'
+      paymentMethod: 'wallet',
+      productSnapshot: {
+        deliveryType: product.deliveryType,
+        fileId: product.fileId || null,
+        deliveryLink: product.deliveryLink || null
+      }
     });
 
     await fb.updateOrderStatus(order.id, 'paid');
@@ -1019,7 +1110,12 @@ bot.action(/^payzabupi_([^_]+)(?:_(.+))?$/, async (ctx) => {
     amount: finalPrice,
     originalAmount: product.price,
     couponUsed: couponUsed || null,
-    paymentMethod: 'zabupi'
+    paymentMethod: 'zabupi',
+    productSnapshot: {
+      deliveryType: product.deliveryType,
+      fileId: product.fileId || null,
+      deliveryLink: product.deliveryLink || null
+    }
   });
 
   const payment = await zabupi.createPaymentOrder({
@@ -1090,11 +1186,30 @@ async function checkAndAlertLowStock(productId) {
 
 // ============ PRODUCT DELIVERY ============
 
+// Redeliver now takes an orderId (not productId) so it can fall back to the
+// order's saved productSnapshot if the admin has since deleted the product —
+// this is what makes re-download keep working after deletion.
 bot.action(/^redeliver_(.+)$/, async (ctx) => {
-  const productId = ctx.match[1];
+  const orderId = ctx.match[1];
   await ctx.answerCbQuery();
-  const product = await fb.getProduct(productId);
-  if (!product) return ctx.reply('Product not found.');
+
+  const order = await fb.getOrder(orderId);
+  if (!order) return ctx.reply('⚠️ Order not found.');
+
+  // Security: only the buyer (or an admin) can re-trigger their own delivery
+  if (String(order.userId) !== String(ctx.from.id) && !fb.isAdmin(ctx.from.id)) {
+    return ctx.answerCbQuery('Not your order.', { show_alert: true });
+  }
+
+  const liveProduct = await fb.getProduct(order.productId);
+  const product = liveProduct || {
+    name: order.productName,
+    ...order.productSnapshot
+  };
+
+  if (!product.deliveryType || (!product.fileId && !product.deliveryLink)) {
+    return ctx.reply('⚠️ Delivery details is order ke liye available nahi hain. Support se contact karo.');
+  }
 
   await deliverProduct(ctx, product, null, true);
 });
@@ -1114,9 +1229,11 @@ async function deliverProduct(ctx, product, orderId, silent) {
         caption: `📦 ${product.name}\n\nThank you for your purchase! 🙏`
       });
     } else if (product.deliveryType === 'link' && product.deliveryLink) {
+      // Sent as plain text (no Markdown parsing) — links often contain
+      // underscores, asterisks, etc. which Telegram Markdown would otherwise
+      // interpret as formatting and corrupt or hide the link entirely.
       await ctx.reply(
-        `📦 *${mdEscape(product.name)}*\n\n🔗 Download Link:\n${product.deliveryLink}\n\nThank you for your purchase! 🙏`,
-        { parse_mode: 'Markdown' }
+        `📦 ${product.name}\n\n🔗 Download Link:\n${product.deliveryLink}\n\nThank you for your purchase! 🙏`
       );
     } else {
       await ctx.reply('⚠️ Delivery content set nahi hai. Support se contact karo, jald hi resolve hoga.');
@@ -1454,10 +1571,11 @@ async function checkAndProcessOrder(orderId) {
           parse_mode: 'Markdown'
         });
       } else if (product.deliveryType === 'link' && product.deliveryLink) {
+        // Plain text (no Markdown) — links often contain underscores/asterisks
+        // which Markdown parsing would otherwise corrupt or hide.
         await bot.telegram.sendMessage(
           order.userId,
-          `✅ *Payment successful!*\n\n📦 ${mdEscape(product.name)}\n\n🔗 Download Link:\n${product.deliveryLink}\n\n🙏 Thank you!`,
-          { parse_mode: 'Markdown' }
+          `✅ Payment successful!\n\n📦 ${product.name}\n\n🔗 Download Link:\n${product.deliveryLink}\n\n🙏 Thank you!`
         );
       }
       await fb.updateOrderStatus(orderId, 'delivered', { deliveredAt: Date.now() });
@@ -1620,12 +1738,21 @@ fb.db.ref('broadcastQueue').on('child_added', async (snap) => {
 
   const prefix = data.isPopup ? '🔔 *Notification*' : '📢 *Announcement*';
   const fileIds = Array.isArray(data.fileIds) ? data.fileIds : [];
+  const imageIds = Array.isArray(data.imageIds) ? data.imageIds : [];
 
   let successCount = 0;
   const deliveredTo = [];
   for (const uid of userIds) {
     try {
-      await bot.telegram.sendMessage(uid, `${prefix}\n\n${data.message}`, extra);
+      if (imageIds.length > 0) {
+        // First image carries the text as its caption; rest are sent bare
+        await bot.telegram.sendPhoto(uid, imageIds[0], { caption: `${prefix}\n\n${data.message}`, ...extra });
+        for (const imgId of imageIds.slice(1)) {
+          try { await bot.telegram.sendPhoto(uid, imgId); } catch (e) { /* skip broken file_id */ }
+        }
+      } else {
+        await bot.telegram.sendMessage(uid, `${prefix}\n\n${data.message}`, extra);
+      }
       for (const fid of fileIds) {
         try { await bot.telegram.sendDocument(uid, fid); } catch (e) { /* skip broken file_id */ }
       }
@@ -1707,15 +1834,20 @@ fb.db.ref('dmQueue').on('child_added', async (snap) => {
   try {
     const prefix = data.isPopup ? '🔔 *Notification*' : '📩 *Message from Admin:*';
     const fileIds = Array.isArray(data.fileIds) ? data.fileIds : [];
+    const imageIds = Array.isArray(data.imageIds) ? data.imageIds : [];
 
-    if (fileIds.length > 0) {
-      // Send the message text first, then each attached file
-      await bot.telegram.sendMessage(data.userId, `${prefix}\n\n${data.message}`, extra);
-      for (const fid of fileIds) {
-        try { await bot.telegram.sendDocument(data.userId, fid); } catch (e) { /* skip broken file_id */ }
+    if (imageIds.length > 0) {
+      const sentMsg = await bot.telegram.sendPhoto(data.userId, imageIds[0], { caption: `${prefix}\n\n${data.message}`, ...extra });
+      await snap.ref.update({ sentMessageId: sentMsg.message_id, sentChatId: sentMsg.chat.id });
+      for (const imgId of imageIds.slice(1)) {
+        try { await bot.telegram.sendPhoto(data.userId, imgId); } catch (e) { /* skip broken file_id */ }
       }
     } else {
-      await bot.telegram.sendMessage(data.userId, `${prefix}\n\n${data.message}`, extra);
+      const sentMsg = await bot.telegram.sendMessage(data.userId, `${prefix}\n\n${data.message}`, extra);
+      await snap.ref.update({ sentMessageId: sentMsg.message_id, sentChatId: sentMsg.chat.id });
+    }
+    for (const fid of fileIds) {
+      try { await bot.telegram.sendDocument(data.userId, fid); } catch (e) { /* skip broken file_id */ }
     }
 
     await snap.ref.update({ sent: true, sentAt: Date.now(), success: true });
@@ -1733,6 +1865,26 @@ fb.db.ref('dmQueue').on('child_added', async (snap) => {
 bot.action('closepopup', async (ctx) => {
   await ctx.answerCbQuery();
   try { await ctx.deleteMessage(); } catch (e) {}
+});
+
+// ============ REMOTE MESSAGE DELETE (admin panel "Unsend" button) ============
+// Admin panel sets deleteRequested:true on a dmQueue entry — this unsends
+// the actual Telegram message from the user's chat, not just the history log.
+
+fb.db.ref('dmQueue').on('child_changed', async (snap) => {
+  const data = snap.val();
+  if (!data || !data.deleteRequested || data.deleted) return;
+  if (!data.sentChatId || !data.sentMessageId) {
+    await snap.ref.update({ deleted: true, deleteError: 'No message reference saved' });
+    return;
+  }
+  try {
+    await bot.telegram.deleteMessage(data.sentChatId, data.sentMessageId);
+    await snap.ref.update({ deleted: true, deletedAt: Date.now() });
+  } catch (err) {
+    // Telegram only allows deleting messages within 48 hours
+    await snap.ref.update({ deleted: true, deleteError: err.message });
+  }
 });
 
 // ============ START SERVERS ============

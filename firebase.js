@@ -322,6 +322,13 @@ async function hasUserBoughtProduct(telegramId, productId) {
   );
 }
 
+async function getBoughtOrder(telegramId, productId) {
+  const orders = await getUserOrders(telegramId);
+  return Object.values(orders).find(o =>
+    o.productId === productId && (o.status === 'paid' || o.status === 'delivered')
+  ) || null;
+}
+
 // ================= REFUNDS =================
 
 async function requestRefund(orderId, reason) {
@@ -494,6 +501,88 @@ async function getUserAnalytics(telegramId) {
   };
 }
 
+// ================= DAILY CHECK-IN =================
+
+async function getCheckInSettings() {
+  const snap = await db.ref('checkInSettings').once('value');
+  return snap.exists() ? snap.val() : { active: true, rewardAmount: 5 };
+}
+
+async function performCheckIn(telegramId) {
+  const settings = await getCheckInSettings();
+  if (!settings.active) return { success: false, reason: 'disabled' };
+
+  const user = await getUser(telegramId);
+  const today = new Date().toDateString();
+  const lastCheckIn = user?.lastCheckInDate;
+
+  if (lastCheckIn === today) {
+    return { success: false, reason: 'already_checked_in', streak: user.checkInStreak || 0 };
+  }
+
+  const yesterday = new Date(Date.now() - 86400000).toDateString();
+  const streak = (lastCheckIn === yesterday) ? (user.checkInStreak || 0) + 1 : 1;
+
+  await db.ref(`users/${telegramId}`).update({
+    lastCheckInDate: today,
+    checkInStreak: streak
+  });
+
+  // Bonus scales slightly with streak, capped at 5x base reward
+  const bonus = Math.min(settings.rewardAmount * Math.ceil(streak / 3), settings.rewardAmount * 5);
+  await creditWallet(telegramId, bonus, 'daily_checkin');
+
+  return { success: true, streak, bonus };
+}
+
+// ================= LEADERBOARD =================
+
+async function getTopBuyers(limit = 10) {
+  const ordersSnap = await db.ref('orders').once('value');
+  if (!ordersSnap.exists()) return [];
+
+  const spendByUser = {};
+  Object.values(ordersSnap.val()).forEach(o => {
+    if (o.status === 'paid' || o.status === 'delivered') {
+      spendByUser[o.userId] = (spendByUser[o.userId] || 0) + (o.amount || 0);
+    }
+  });
+
+  const usersSnap = await db.ref('users').once('value');
+  const users = usersSnap.exists() ? usersSnap.val() : {};
+
+  return Object.entries(spendByUser)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([uid, spent]) => ({
+      telegramId: uid,
+      name: users[uid]?.name || 'Unknown',
+      totalSpent: spent
+    }));
+}
+
+async function getTopReferrers(limit = 10) {
+  const usersSnap = await db.ref('users').once('value');
+  if (!usersSnap.exists()) return [];
+  const users = usersSnap.val();
+
+  const referralCounts = {};
+  Object.entries(users).forEach(([uid, u]) => {
+    if (u.referredBy) {
+      referralCounts[u.referredBy] = (referralCounts[u.referredBy] || 0) + 1;
+    }
+  });
+
+  return Object.entries(referralCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([uid, count]) => ({
+      telegramId: uid,
+      name: users[uid]?.name || 'Unknown',
+      referralCount: count
+    }));
+}
+
 // ================= ADMIN CHECK =================
 
 function isAdmin(telegramId) {
@@ -533,6 +622,7 @@ module.exports = {
   getOrderByPayRef,
   getUserOrders,
   hasUserBoughtProduct,
+  getBoughtOrder,
   requestRefund,
   processRefund,
   getSalesReport,
@@ -546,5 +636,9 @@ module.exports = {
   incrementProductViews,
   updateProduct,
   getUserAnalytics,
+  getCheckInSettings,
+  performCheckIn,
+  getTopBuyers,
+  getTopReferrers,
   isAdmin
 };
