@@ -1,0 +1,19 @@
+{
+  "name": "telegram-shop-bot",
+  "version": "2.0.0",
+  "description": "Telegram digital product selling bot with ZapUPI payment gateway (local JSON storage, in-bot admin panel)",
+  "main": "bot.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "express": "^4.19.2",
+    "axios": "^1.6.8",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
