@@ -1,8 +1,9 @@
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const express = require('express');
-const fb = require('./firebase');
+const fb = require('./localdb');
 const zabupi = require('./zabupi');
+const { setupAdminPanel } = require('./adminPanel');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const app = express();
@@ -24,6 +25,10 @@ function mdEscape(text) {
   if (text === undefined || text === null) return '';
   return String(text).replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
 }
+
+// Sets up all /admin commands and callback handlers (products, orders,
+// users, coupons, broadcast, settings, backup) — see adminPanel.js.
+const adminPanel = setupAdminPanel(bot, fb, mdEscape);
 
 async function smartReply(ctx, text, extra = {}) {
   const payload = { parse_mode: 'Markdown', ...extra };
@@ -87,21 +92,18 @@ function navButtons(extraRows, telegramId) {
 bot.use(async (ctx, next) => {
   if (ctx.from) {
     try {
-      const [dmSnap, bSnap] = await Promise.all([
-        fb.db.ref(`users/${ctx.from.id}/lastUnseenDmId`).once('value'),
-        fb.db.ref(`users/${ctx.from.id}/lastUnseenBroadcastId`).once('value')
-      ]);
-
-      const dmId = dmSnap.val();
+      const dmId = await fb.getUserField(ctx.from.id, 'lastUnseenDmId');
       if (dmId) {
-        await fb.db.ref(`dmQueue/${dmId}`).update({ seen: true, seenAt: Date.now() });
-        await fb.db.ref(`users/${ctx.from.id}/lastUnseenDmId`).remove();
+        await fb.updateDmEntry(dmId, { seen: true, seenAt: Date.now() });
+        await fb.clearUserField(ctx.from.id, 'lastUnseenDmId');
       }
 
-      const bId = bSnap.val();
+      const bId = await fb.getUserField(ctx.from.id, 'lastUnseenBroadcastId');
       if (bId) {
-        await fb.db.ref(`broadcastQueue/${bId}/seenCount`).transaction(current => (current || 0) + 1);
-        await fb.db.ref(`users/${ctx.from.id}/lastUnseenBroadcastId`).remove();
+        const queue = await fb.getBroadcastQueue();
+        const current = queue[bId]?.seenCount || 0;
+        await fb.updateBroadcastEntry(bId, { seenCount: current + 1 });
+        await fb.clearUserField(ctx.from.id, 'lastUnseenBroadcastId');
       }
     } catch (e) { /* non-critical — never block the actual request */ }
   }
@@ -159,7 +161,7 @@ bot.use(async (ctx, next) => {
     // it so we can send them there after they finish joining, instead of
     // dropping them on the generic main menu.
     if (ctx.startPayload) {
-      await fb.db.ref(`users/${ctx.from.id}/pendingDeepLink`).set(ctx.startPayload);
+      await fb.setUserField(ctx.from.id, 'pendingDeepLink', ctx.startPayload);
     }
     await sendJoinPrompt(ctx, notJoined);
     return; // block everything else
@@ -215,10 +217,9 @@ bot.action('check_joined', async (ctx) => {
 
     // If they arrived via a product deep-link before joining, send them
     // straight to that product now instead of the generic main menu.
-    const pendingSnap = await fb.db.ref(`users/${telegramId}/pendingDeepLink`).once('value');
-    const pendingPayload = pendingSnap.val();
+    const pendingPayload = await fb.getUserField(telegramId, 'pendingDeepLink');
     if (pendingPayload) {
-      await fb.db.ref(`users/${telegramId}/pendingDeepLink`).remove();
+      await fb.clearUserField(telegramId, 'pendingDeepLink');
       if (pendingPayload.startsWith('PROD_')) {
         const productId = pendingPayload.slice('PROD_'.length);
         const product = await fb.getProduct(productId);
@@ -567,11 +568,7 @@ async function renderPaymentHistory(ctx) {
   const orders = await fb.getUserOrders(telegramId);
   const paidOrders = Object.values(orders).filter(o => o.status === 'paid' || o.status === 'delivered');
 
-  const txns = await new Promise((resolve) => {
-    fb.db.ref('walletTransactions').orderByChild('userId').equalTo(String(telegramId)).once('value', snap => {
-      resolve(snap.exists() ? Object.values(snap.val()) : []);
-    });
-  });
+  const txns = await fb.getUserWalletTransactions(telegramId);
 
   // Merge orders (ZapUPI + wallet purchases) and raw wallet transactions
   // (top-ups, referral bonuses, refunds) into one timeline.
@@ -880,8 +877,12 @@ async function sendProductCard(ctx, id, p) {
 
   const buttons = navButtons(rows, telegramId);
 
-  // Support multiple images (imageUrls array) or fallback to single imageUrl
-  const images = Array.isArray(p.imageUrls) && p.imageUrls.length > 0 ? p.imageUrls : (p.imageUrl ? [p.imageUrl] : []);
+  // Support multiple images (imageUrls array), a single imageUrl, or a
+  // Telegram file_id (imageFileId) from the admin panel's photo upload —
+  // replyWithPhoto accepts URLs and file_ids interchangeably.
+  const images = Array.isArray(p.imageUrls) && p.imageUrls.length > 0
+    ? p.imageUrls
+    : (p.imageFileId ? [p.imageFileId] : (p.imageUrl ? [p.imageUrl] : []));
 
   if (images.length > 1) {
     const mediaGroup = images.map((url, i) => ({
@@ -1382,25 +1383,38 @@ bot.command('msg', async (ctx) => {
   }
 });
 
-// Utility: send any file to bot to get its file_id (for product delivery setup)
+// Document handler: during the admin product wizard, this saves the file
+// for delivery. Otherwise (outside a wizard), admins get the raw file_id
+// as a fallback utility for manual use.
 bot.on('document', async (ctx) => {
   if (!fb.isAdmin(ctx.from.id)) return;
-  await ctx.reply(`📎 File ID:\n\`${ctx.message.document.file_id}\`\n\nAdmin panel mein product add karte waqt yeh paste karo.`, { parse_mode: 'Markdown' });
+
+  const handled = await adminPanel.handleAdminDocument(ctx);
+  if (handled) return;
+
+  await ctx.reply(`📎 File ID:\n\`${ctx.message.document.file_id}\`\n\nUse /admin → Products → Add Product to use this in the wizard.`, { parse_mode: 'Markdown' });
 });
 
-// Utility: send a photo to get its file_id (for broadcast/DM image attachments)
+// Photo handler: during the admin product wizard, this saves the product
+// image. Otherwise, admins get the raw file_id for manual broadcast/DM use.
 bot.on('photo', async (ctx) => {
   if (!fb.isAdmin(ctx.from.id)) return;
-  // Telegram sends multiple sizes of the same photo — the last one is the
-  // largest/original resolution, which is what you want for sending back out.
+
+  const handled = await adminPanel.handleAdminPhoto(ctx);
+  if (handled) return;
+
   const sizes = ctx.message.photo;
   const largest = sizes[sizes.length - 1];
-  await ctx.reply(`🖼 Photo File ID:\n\`${largest.file_id}\`\n\nAdmin panel mein broadcast/DM "Attach Images" field mein yeh paste karo.`, { parse_mode: 'Markdown' });
+  await ctx.reply(`🖼 Photo File ID:\n\`${largest.file_id}\`\n\nUse /admin → Broadcast or Direct Message to attach images with this.`, { parse_mode: 'Markdown' });
 });
 
 // ============ TEXT HANDLER (for multi-step states) ============
 
 bot.on('text', async (ctx) => {
+  // Admin wizard steps take priority over the regular user-facing flows
+  const adminHandled = await adminPanel.handleAdminText(ctx);
+  if (adminHandled) return;
+
   const state = userState[ctx.from.id];
   if (!state) return; // ignore, no active flow
 
@@ -1660,16 +1674,9 @@ async function replacePaymentMessage(order, text) {
 setInterval(async () => {
   try {
     const cutoff = Date.now() - 60 * 60 * 1000; // only check orders from the last hour
-    const snap = await fb.db.ref('orders')
-      .orderByChild('status')
-      .equalTo('pending')
-      .once('value');
-    if (!snap.exists()) return;
+    const pending = await fb.getPendingOrdersByMethod('zabupi', cutoff);
 
-    const orders = snap.val();
-    for (const [orderId, order] of Object.entries(orders)) {
-      if (order.paymentMethod !== 'zabupi') continue;
-      if (order.createdAt < cutoff) continue;
+    for (const [orderId] of pending) {
       await checkAndProcessOrder(orderId);
     }
   } catch (err) {
@@ -1764,219 +1771,184 @@ app.get('/payment-timeout', (req, res) => {
 
 app.get('/', (req, res) => res.send('Bot server running ✅'));
 
-// ============ BROADCAST LISTENER ============
-// Admin panel writes to broadcastQueue/{id} with { message, sent:false, buttonText?, buttonUrl? }
-// This listens in real-time and sends to all users, then marks sent:true
+// ============ QUEUE PROCESSING (polling-based) ============
+// Local JSON storage has no real-time push events like Firebase's
+// child_added/child_changed — instead, we poll the broadcast/DM queues and
+// the products list every few seconds and process anything new.
 
-fb.db.ref('broadcastQueue').on('child_added', async (snap) => {
-  const data = snap.val();
-  if (!data || data.sent) return;
+async function processBroadcastQueue() {
+  const queue = await fb.getBroadcastQueue();
 
-  const users = await fb.getAllUsers();
-  const userIds = Object.keys(users);
-
-  const inlineKeyboard = [];
-  if (data.buttonText && data.buttonUrl) {
-    inlineKeyboard.push([{ text: data.buttonText, url: data.buttonUrl }]);
-  }
-  if (data.isPopup) {
-    inlineKeyboard.push([{ text: '❌ Close', callback_data: 'closepopup' }]);
-  }
-  const extra = { parse_mode: 'Markdown' };
-  if (inlineKeyboard.length > 0) extra.reply_markup = { inline_keyboard: inlineKeyboard };
-
-  const prefix = data.isPopup ? '🔔 *Notification*' : '📢 *Announcement*';
-  const fileIds = Array.isArray(data.fileIds) ? data.fileIds : [];
-  const imageIds = Array.isArray(data.imageIds) ? data.imageIds : [];
-
-  let successCount = 0;
-  const deliveredTo = [];
-  const sentMessages = {}; // { userId: { chatId, messageId } } — needed to unsend later
-
-  for (const uid of userIds) {
-    try {
-      let sentMsg;
-      if (imageIds.length > 0) {
-        // First image carries the text as its caption; rest are sent bare
-        sentMsg = await bot.telegram.sendPhoto(uid, imageIds[0], { caption: `${prefix}\n\n${data.message}`, ...extra });
-        for (const imgId of imageIds.slice(1)) {
-          try { await bot.telegram.sendPhoto(uid, imgId); } catch (e) { /* skip broken file_id */ }
-        }
-      } else {
-        sentMsg = await bot.telegram.sendMessage(uid, `${prefix}\n\n${data.message}`, extra);
+  for (const [id, data] of Object.entries(queue)) {
+    // ---- Handle unsend requests ----
+    if (data.deleteRequested && !data.deleted) {
+      const sentMessages = data.sentMessages || {};
+      const entries = Object.entries(sentMessages);
+      if (entries.length === 0) {
+        await fb.updateBroadcastEntry(id, { deleted: true, deleteError: 'No message references saved' });
+        continue;
       }
-      for (const fid of fileIds) {
-        try { await bot.telegram.sendDocument(uid, fid); } catch (e) { /* skip broken file_id */ }
+      let unsentCount = 0;
+      for (const [uid, ref] of entries) {
+        try { await bot.telegram.deleteMessage(ref.chatId, ref.messageId); unsentCount++; }
+        catch (err) { /* too old (48h+) or already gone — skip */ }
+        await new Promise(r => setTimeout(r, 50));
       }
-      sentMessages[uid] = { chatId: sentMsg.chat.id, messageId: sentMsg.message_id };
-      successCount++;
-      deliveredTo.push(uid);
-      // Mark this broadcast as this user's "latest unseen" — same proxy
-      // pattern as DMs, since Bot API gives no real read-receipt access.
-      await fb.db.ref(`users/${uid}/lastUnseenBroadcastId`).set(snap.key);
-    } catch (e) {
-      // user may have blocked the bot — skip silently
+      await fb.updateBroadcastEntry(id, { deleted: true, deletedAt: Date.now(), unsentCount });
+      console.log(`🗑️ Broadcast unsent from ${unsentCount}/${entries.length} chats`);
+      continue;
     }
-    await new Promise(r => setTimeout(r, 50)); // avoid hitting Telegram rate limits
-  }
 
-  await snap.ref.update({
-    sent: true,
-    sentAt: Date.now(),
-    sentCount: successCount,
-    targetCount: userIds.length,
-    seenCount: 0,
-    sentMessages
-  });
-  console.log(`📢 Broadcast sent to ${successCount}/${userIds.length} users`);
-});
+    // ---- Handle new (unsent) broadcasts ----
+    if (data.sent) continue;
 
-// Admin panel sets deleteRequested:true on a broadcastQueue entry — this
-// unsends the actual Telegram message from every recipient's chat.
-fb.db.ref('broadcastQueue').on('child_changed', async (snap) => {
-  const data = snap.val();
-  if (!data || !data.deleteRequested || data.deleted) return;
+    const users = await fb.getAllUsers();
+    const userIds = Object.keys(users);
 
-  const sentMessages = data.sentMessages || {};
-  const entries = Object.entries(sentMessages);
+    const inlineKeyboard = [];
+    if (data.buttonText && data.buttonUrl) inlineKeyboard.push([{ text: data.buttonText, url: data.buttonUrl }]);
+    if (data.isPopup) inlineKeyboard.push([{ text: '❌ Close', callback_data: 'closepopup' }]);
+    const extra = { parse_mode: 'Markdown' };
+    if (inlineKeyboard.length > 0) extra.reply_markup = { inline_keyboard: inlineKeyboard };
 
-  if (entries.length === 0) {
-    await snap.ref.update({ deleted: true, deleteError: 'No message references saved' });
-    return;
-  }
-
-  let unsentCount = 0;
-  for (const [uid, ref] of entries) {
-    try {
-      await bot.telegram.deleteMessage(ref.chatId, ref.messageId);
-      unsentCount++;
-    } catch (err) {
-      // message too old (48h+ limit) or already deleted — skip
-    }
-    await new Promise(r => setTimeout(r, 50));
-  }
-
-  await snap.ref.update({ deleted: true, deletedAt: Date.now(), unsentCount });
-  console.log(`🗑️ Broadcast unsent from ${unsentCount}/${entries.length} chats`);
-});
-
-// ============ INDIVIDUAL DM LISTENER (from admin panel) ============
-// Admin panel writes to dmQueue/{id} with { userId, message, sent:false, buttonText?, buttonUrl? }
-// This queue itself doubles as message history — the admin panel reads it directly.
-
-// ============ NEW PRODUCT NOTIFICATION ============
-// Automatically notifies all users when admin adds a new active product.
-// Skips products created before the bot started (avoids a notification
-// storm on first deploy) via the `notifiedNewProduct` marker.
-
-fb.db.ref('products').on('child_added', async (snap) => {
-  const product = snap.val();
-  if (!product || !product.active || product.notifiedNewProduct) return;
-
-  // Only notify for products created in the last 2 minutes — protects
-  // against re-notifying on bot restart for older products.
-  if (!product.createdAt || Date.now() - product.createdAt > 2 * 60 * 1000) return;
-
-  await snap.ref.update({ notifiedNewProduct: true });
-
-  const users = await fb.getAllUsers();
-  const userIds = Object.keys(users);
-  const priceLabel = product.price === 0 ? 'FREE 🎁' : `₹${product.price}`;
-
-  for (const uid of userIds) {
-    try {
-      await bot.telegram.sendMessage(
-        uid,
-        `🆕 *New Product Added!*\n\n✨ ${mdEscape(product.name)}\n💰 ${priceLabel}\n\n${mdEscape(product.description || '')}`,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: { inline_keyboard: [[{ text: '👀 View Product', callback_data: `viewproduct_${snap.key}` }]] }
-        }
-      );
-    } catch (e) { /* user blocked bot — skip */ }
-    await new Promise(r => setTimeout(r, 50));
-  }
-  console.log(`🆕 New product notification sent for "${product.name}"`);
-});
-
-fb.db.ref('dmQueue').on('child_added', async (snap) => {
-  const data = snap.val();
-  if (!data || data.sent || !data.userId || !data.message) return;
-
-  const inlineKeyboard = [];
-  if (data.buttonText && data.buttonUrl) {
-    inlineKeyboard.push([{ text: data.buttonText, url: data.buttonUrl }]);
-  }
-  if (data.isPopup) {
-    inlineKeyboard.push([{ text: '❌ Close', callback_data: 'closepopup' }]);
-  }
-
-  const extra = { parse_mode: 'Markdown' };
-  if (inlineKeyboard.length > 0) extra.reply_markup = { inline_keyboard: inlineKeyboard };
-
-  try {
-    const prefix = data.isPopup ? '🔔 *Notification*' : '📩 *Message from Admin:*';
+    const prefix = data.isPopup ? '🔔 *Notification*' : '📢 *Announcement*';
     const fileIds = Array.isArray(data.fileIds) ? data.fileIds : [];
     const imageIds = Array.isArray(data.imageIds) ? data.imageIds : [];
 
-    if (imageIds.length > 0) {
-      const sentMsg = await bot.telegram.sendPhoto(data.userId, imageIds[0], { caption: `${prefix}\n\n${data.message}`, ...extra });
-      await snap.ref.update({ sentMessageId: sentMsg.message_id, sentChatId: sentMsg.chat.id });
-      for (const imgId of imageIds.slice(1)) {
-        try { await bot.telegram.sendPhoto(data.userId, imgId); } catch (e) { /* skip broken file_id */ }
-      }
-    } else {
-      const sentMsg = await bot.telegram.sendMessage(data.userId, `${prefix}\n\n${data.message}`, extra);
-      await snap.ref.update({ sentMessageId: sentMsg.message_id, sentChatId: sentMsg.chat.id });
-    }
-    for (const fid of fileIds) {
-      try { await bot.telegram.sendDocument(data.userId, fid); } catch (e) { /* skip broken file_id */ }
+    let successCount = 0;
+    const sentMessages = {};
+
+    for (const uid of userIds) {
+      try {
+        let sentMsg;
+        if (imageIds.length > 0) {
+          sentMsg = await bot.telegram.sendPhoto(uid, imageIds[0], { caption: `${prefix}\n\n${data.message}`, ...extra });
+          for (const imgId of imageIds.slice(1)) {
+            try { await bot.telegram.sendPhoto(uid, imgId); } catch (e) {}
+          }
+        } else {
+          sentMsg = await bot.telegram.sendMessage(uid, `${prefix}\n\n${data.message}`, extra);
+        }
+        for (const fid of fileIds) {
+          try { await bot.telegram.sendDocument(uid, fid); } catch (e) {}
+        }
+        sentMessages[uid] = { chatId: sentMsg.chat.id, messageId: sentMsg.message_id };
+        successCount++;
+        await fb.setUserField(uid, 'lastUnseenBroadcastId', id);
+      } catch (e) { /* user blocked bot — skip */ }
+      await new Promise(r => setTimeout(r, 50));
     }
 
-    await snap.ref.update({ sent: true, sentAt: Date.now(), success: true });
-    // Mark this as the user's "latest unseen DM" — cleared to seen=true the
-    // next time they interact with the bot at all. Telegram's Bot API has no
-    // true read-receipt access, so "seen" here means "was active in the bot
-    // after this was delivered" — the closest reliable proxy available.
-    await fb.db.ref(`users/${data.userId}/lastUnseenDmId`).set(snap.key);
-  } catch (err) {
-    await snap.ref.update({ sent: true, sentAt: Date.now(), success: false, error: err.message });
+    await fb.updateBroadcastEntry(id, {
+      sent: true, sentAt: Date.now(), sentCount: successCount,
+      targetCount: userIds.length, seenCount: 0, sentMessages
+    });
+    console.log(`📢 Broadcast sent to ${successCount}/${userIds.length} users`);
   }
-});
+}
+
+async function processDmQueue() {
+  const queue = await fb.getDmQueue();
+
+  for (const [id, data] of Object.entries(queue)) {
+    // ---- Handle unsend requests ----
+    if (data.deleteRequested && !data.deleted) {
+      if (!data.sentChatId || !data.sentMessageId) {
+        await fb.updateDmEntry(id, { deleted: true, deleteError: 'No message reference saved' });
+        continue;
+      }
+      try {
+        await bot.telegram.deleteMessage(data.sentChatId, data.sentMessageId);
+        await fb.updateDmEntry(id, { deleted: true, deletedAt: Date.now() });
+      } catch (err) {
+        await fb.updateDmEntry(id, { deleted: true, deleteError: err.message });
+      }
+      continue;
+    }
+
+    // ---- Handle new (unsent) DMs ----
+    if (data.sent || !data.userId || !data.message) continue;
+
+    const inlineKeyboard = [];
+    if (data.buttonText && data.buttonUrl) inlineKeyboard.push([{ text: data.buttonText, url: data.buttonUrl }]);
+    if (data.isPopup) inlineKeyboard.push([{ text: '❌ Close', callback_data: 'closepopup' }]);
+    const extra = { parse_mode: 'Markdown' };
+    if (inlineKeyboard.length > 0) extra.reply_markup = { inline_keyboard: inlineKeyboard };
+
+    try {
+      const prefix = data.isPopup ? '🔔 *Notification*' : '📩 *Message from Admin:*';
+      const fileIds = Array.isArray(data.fileIds) ? data.fileIds : [];
+      const imageIds = Array.isArray(data.imageIds) ? data.imageIds : [];
+      let sentMsg;
+
+      if (imageIds.length > 0) {
+        sentMsg = await bot.telegram.sendPhoto(data.userId, imageIds[0], { caption: `${prefix}\n\n${data.message}`, ...extra });
+        for (const imgId of imageIds.slice(1)) {
+          try { await bot.telegram.sendPhoto(data.userId, imgId); } catch (e) {}
+        }
+      } else {
+        sentMsg = await bot.telegram.sendMessage(data.userId, `${prefix}\n\n${data.message}`, extra);
+      }
+      for (const fid of fileIds) {
+        try { await bot.telegram.sendDocument(data.userId, fid); } catch (e) {}
+      }
+
+      await fb.updateDmEntry(id, {
+        sent: true, sentAt: Date.now(), success: true,
+        sentChatId: sentMsg.chat.id, sentMessageId: sentMsg.message_id
+      });
+      await fb.setUserField(data.userId, 'lastUnseenDmId', id);
+    } catch (err) {
+      await fb.updateDmEntry(id, { sent: true, sentAt: Date.now(), success: false, error: err.message });
+    }
+  }
+}
+
+async function processNewProductNotifications() {
+  const products = await fb.getAllProducts(false);
+
+  for (const [id, product] of Object.entries(products)) {
+    if (!product.active || product.notifiedNewProduct) continue;
+    // Only notify for products created in the last 2 minutes — protects
+    // against re-notifying on bot restart for older products.
+    if (!product.createdAt || Date.now() - product.createdAt > 2 * 60 * 1000) continue;
+
+    await fb.updateProduct(id, { notifiedNewProduct: true });
+
+    const users = await fb.getAllUsers();
+    const userIds = Object.keys(users);
+    const priceLabel = product.price === 0 ? 'FREE 🎁' : `₹${product.price}`;
+
+    for (const uid of userIds) {
+      try {
+        await bot.telegram.sendMessage(
+          uid,
+          `🆕 *New Product Added!*\n\n✨ ${mdEscape(product.name)}\n💰 ${priceLabel}\n\n${mdEscape(product.description || '')}`,
+          { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '👀 View Product', callback_data: `viewproduct_${id}` }]] } }
+        );
+      } catch (e) {}
+      await new Promise(r => setTimeout(r, 50));
+    }
+    console.log(`🆕 New product notification sent for "${product.name}"`);
+  }
+}
+
+setInterval(async () => {
+  try { await processBroadcastQueue(); } catch (err) { console.error('Broadcast queue error:', err); }
+}, 5000);
+
+setInterval(async () => {
+  try { await processDmQueue(); } catch (err) { console.error('DM queue error:', err); }
+}, 5000);
+
+setInterval(async () => {
+  try { await processNewProductNotifications(); } catch (err) { console.error('Product notification error:', err); }
+}, 10000);
 
 // Closes a popup-style message by deleting it
 bot.action('closepopup', async (ctx) => {
   await ctx.answerCbQuery();
   try { await ctx.deleteMessage(); } catch (e) {}
-});
-
-// ============ REMOTE MESSAGE DELETE (admin panel "Unsend" button) ============
-// Admin panel sets deleteRequested:true on a dmQueue entry — this unsends
-// the actual Telegram message from the user's chat, not just the history log.
-
-fb.db.ref('dmQueue').on('child_changed', async (snap) => {
-  const data = snap.val();
-  if (!data || !data.deleteRequested || data.deleted) return;
-
-  // Claim this delete request atomically so a duplicate/late-firing event
-  // (Firebase can re-fire child_changed) never tries to delete twice.
-  const claim = await snap.ref.child('deleted').transaction(current => {
-    if (current === true) return; // already claimed — abort
-    return true;
-  });
-  if (!claim.committed) return;
-
-  if (!data.sentChatId || !data.sentMessageId) {
-    await snap.ref.update({ deleteError: 'No message reference saved' });
-    return;
-  }
-  try {
-    await bot.telegram.deleteMessage(data.sentChatId, data.sentMessageId);
-    await snap.ref.update({ deletedAt: Date.now() });
-  } catch (err) {
-    // Telegram only allows deleting messages within 48 hours
-    await snap.ref.update({ deleteError: err.message });
-  }
 });
 
 // ============ START SERVERS ============
