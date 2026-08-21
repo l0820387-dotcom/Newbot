@@ -29,7 +29,8 @@ const FILES = {
   proPlanSettings: 'proPlanSettings.json',
   checkInSettings: 'checkInSettings.json',
   broadcastQueue: 'broadcastQueue.json',
-  dmQueue: 'dmQueue.json'
+  dmQueue: 'dmQueue.json',
+  staff: 'staff.json'
 };
 
 // ---- Low-level file read/write with an in-process write queue so
@@ -780,6 +781,41 @@ async function getPendingOrdersByMethod(paymentMethod, sinceTimestamp) {
   );
 }
 
+// ================= STAFF SYSTEM =================
+// Staff are non-owner admins with limited permissions (managed via a
+// separate list from ADMIN_TELEGRAM_IDS, which remains the full-owner list).
+
+async function getAllStaff() {
+  const s = readCollection('staff');
+  return s;
+}
+
+async function addStaff(telegramId, permissions) {
+  const staff = readCollection('staff');
+  staff[String(telegramId)] = {
+    telegramId: String(telegramId),
+    permissions: permissions || ['products', 'orders'], // default limited scope
+    addedAt: Date.now()
+  };
+  await writeCollection('staff', staff);
+}
+
+async function removeStaff(telegramId) {
+  const staff = readCollection('staff');
+  delete staff[String(telegramId)];
+  await writeCollection('staff', staff);
+}
+
+async function isStaff(telegramId) {
+  const staff = readCollection('staff');
+  return !!staff[String(telegramId)];
+}
+
+async function getStaffPermissions(telegramId) {
+  const staff = readCollection('staff');
+  return staff[String(telegramId)]?.permissions || [];
+}
+
 module.exports = {
   getUser,
   createUserIfNotExists,
@@ -853,5 +889,10 @@ module.exports = {
   clearUserField,
   getUserWalletTransactions,
   getPendingOrdersByMethod,
+  getAllStaff,
+  addStaff,
+  removeStaff,
+  isStaff,
+  getStaffPermissions,
   isAdmin
 };

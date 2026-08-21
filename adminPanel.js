@@ -10,28 +10,49 @@ const { Markup } = require('telegraf');
 function setupAdminPanel(bot, fb, mdEscape) {
   const adminState = {}; // { telegramId: { step, data } } — separate from user-facing userState
 
+  // Full owners (ADMIN_TELEGRAM_IDS) always pass. Staff pass a lighter check
+  // since their menu is filtered by permission — isAdmin() itself just gates
+  // "can open the panel at all", not which buttons they see.
   function isAdmin(ctx) {
     return fb.isAdmin(ctx.from.id);
+  }
+
+  async function isAdminOrStaff(ctx) {
+    if (fb.isAdmin(ctx.from.id)) return true;
+    return await fb.isStaff(ctx.from.id);
+  }
+
+  async function isOwner(ctx) {
+    return fb.isAdmin(ctx.from.id); // only full owners, never staff
   }
 
   // ============ MAIN ADMIN MENU ============
 
   bot.command('admin', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     delete adminState[ctx.from.id];
     await sendAdminMenu(ctx);
   });
 
   async function sendAdminMenu(ctx) {
-    const text = '🛠 *Admin Control Panel*\n\nChoose a section:';
-    const buttons = Markup.inlineKeyboard([
-      [Markup.button.callback('📦 Products', 'admin_products'), Markup.button.callback('🧾 Orders', 'admin_orders')],
-      [Markup.button.callback('👥 Users', 'admin_users'), Markup.button.callback('🎟 Coupons', 'admin_coupons')],
-      [Markup.button.callback('📢 Broadcast', 'admin_broadcast'), Markup.button.callback('📩 Direct Message', 'admin_dm')],
-      [Markup.button.callback('⚙️ Bot Settings', 'admin_settings'), Markup.button.callback('👑 Pro Plan', 'admin_proplan')],
-      [Markup.button.callback('📊 Sales Report', 'admin_report'), Markup.button.callback('🏆 Leaderboard', 'admin_leaderboard')],
-      [Markup.button.callback('💾 Backup Data', 'admin_backup')]
-    ]);
+    const owner = await isOwner(ctx);
+    const perms = owner ? null : await fb.getStaffPermissions(ctx.from.id);
+    const has = (p) => owner || perms.includes(p);
+
+    const text = owner ? '🛠 *Admin Control Panel*\n\nChoose a section:' : '🛠 *Staff Panel*\n\nChoose a section:';
+    const rows = [];
+    if (has('products')) rows.push([Markup.button.callback('📦 Products', 'admin_products'), Markup.button.callback('🧾 Orders', 'admin_orders')]);
+    if (has('users')) rows.push([Markup.button.callback('👥 Users', 'admin_users'), Markup.button.callback('↩️ Refunds', 'admin_refunds')]);
+    if (has('coupons')) rows.push([Markup.button.callback('🎟 Coupons', 'admin_coupons'), Markup.button.callback('🔗 Referral', 'admin_referral')]);
+    if (has('broadcast')) rows.push([Markup.button.callback('📢 Broadcast', 'admin_broadcast'), Markup.button.callback('📩 Direct Message', 'admin_dm')]);
+    if (has('broadcast')) rows.push([Markup.button.callback('📜 Message History', 'admin_msghistory')]);
+    if (owner) rows.push([Markup.button.callback('⚙️ Bot Settings', 'admin_settings'), Markup.button.callback('🔘 Menu Buttons', 'admin_menubuttons')]);
+    if (owner) rows.push([Markup.button.callback('👑 Pro Plan', 'admin_proplan'), Markup.button.callback('🎯 Check-in', 'admin_checkin')]);
+    if (has('products')) rows.push([Markup.button.callback('📊 Sales Report', 'admin_report'), Markup.button.callback('🏆 Leaderboard', 'admin_leaderboard')]);
+    if (owner) rows.push([Markup.button.callback('🧑‍💼 Staff', 'admin_staff'), Markup.button.callback('💾 Backup Data', 'admin_backup')]);
+    else if (has('products')) rows.push([Markup.button.callback('💾 Backup Data', 'admin_backup')]);
+
+    const buttons = Markup.inlineKeyboard(rows);
     if (ctx.callbackQuery) {
       try { await ctx.editMessageText(text, { parse_mode: 'Markdown', ...buttons }); return; }
       catch (e) { try { await ctx.deleteMessage(); } catch (e2) {} }
@@ -44,7 +65,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   }
 
   bot.action('admin_home', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery();
     delete adminState[ctx.from.id];
     await sendAdminMenu(ctx);
@@ -53,7 +74,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   // ============ PRODUCTS ============
 
   bot.action('admin_products', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery();
     await sendProductsList(ctx);
   });
@@ -83,7 +104,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   }
 
   bot.action(/^admin_prod_(.+)$/, async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     const productId = ctx.match[1];
     const p = await fb.getProduct(productId);
     if (!p) return ctx.answerCbQuery('Product not found.');
@@ -104,7 +125,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   });
 
   bot.action(/^admin_toggleprod_(.+)$/, async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     const productId = ctx.match[1];
     const p = await fb.getProduct(productId);
     if (!p) return ctx.answerCbQuery('Not found.');
@@ -123,7 +144,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   });
 
   bot.action(/^admin_prodlink_(.+)$/, async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     const productId = ctx.match[1];
     await ctx.answerCbQuery();
     const botInfo = await bot.telegram.getMe();
@@ -132,7 +153,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   });
 
   bot.action(/^admin_delprod_(.+)$/, async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     const productId = ctx.match[1];
     const p = await fb.getProduct(productId);
     if (!p) return ctx.answerCbQuery('Not found.');
@@ -155,7 +176,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   });
 
   bot.action(/^admin_confirmdelprod_(.+)$/, async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     const productId = ctx.match[1];
     await fb.deleteProduct(productId);
     await ctx.answerCbQuery('🗑️ Deleted');
@@ -165,14 +186,14 @@ function setupAdminPanel(bot, fb, mdEscape) {
   // ---- Add / Edit product flow (conversational) ----
 
   bot.action('admin_addproduct', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery();
     adminState[ctx.from.id] = { step: 'prod_name', data: { isEdit: false } };
     await ctx.reply('📦 *Add Product*\n\nStep 1/8 — Product name?', { parse_mode: 'Markdown' });
   });
 
   bot.action(/^admin_editprod_(.+)$/, async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     const productId = ctx.match[1];
     const p = await fb.getProduct(productId);
     if (!p) return ctx.answerCbQuery('Not found.');
@@ -184,7 +205,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   // ============ ORDERS ============
 
   bot.action('admin_orders', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery();
     await sendOrdersMenu(ctx);
   });
@@ -223,7 +244,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   }
 
   bot.action(/^admin_orderf_(.+)$/, async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery();
     await sendOrdersMenu(ctx, ctx.match[1]);
   });
@@ -231,7 +252,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   // ============ USERS ============
 
   bot.action('admin_users', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery();
     adminState[ctx.from.id] = { step: 'awaiting_user_lookup' };
     await ctx.reply('👥 *Users*\n\nSend a Telegram ID to view details, or use:\n/ban <id> <reason>\n/unban <id>\n/msg <id> <message>', {
@@ -260,7 +281,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   }
 
   bot.action(/^admin_wallet_(.+)$/, async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     const telegramId = ctx.match[1];
     await ctx.answerCbQuery();
     adminState[ctx.from.id] = { step: 'awaiting_wallet_amount', data: { telegramId } };
@@ -268,7 +289,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   });
 
   bot.action(/^admin_banuser_(.+)$/, async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     const telegramId = ctx.match[1];
     await ctx.answerCbQuery();
     adminState[ctx.from.id] = { step: 'awaiting_ban_reason', data: { telegramId } };
@@ -276,7 +297,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   });
 
   bot.action(/^admin_unban_(.+)$/, async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     const telegramId = ctx.match[1];
     await fb.unbanUser(telegramId);
     await ctx.answerCbQuery('✅ Unbanned');
@@ -284,17 +305,75 @@ function setupAdminPanel(bot, fb, mdEscape) {
   });
 
   bot.action(/^admin_msguser_(.+)$/, async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     const telegramId = ctx.match[1];
     await ctx.answerCbQuery();
-    adminState[ctx.from.id] = { step: 'awaiting_dm_message', data: { telegramId } };
+    adminState[ctx.from.id] = { step: 'dm_message', data: { telegramId } };
     await ctx.reply('📩 Type the message to send:');
+  });
+
+  // ============ REFUNDS ============
+
+  bot.action('admin_refunds', async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    await ctx.answerCbQuery();
+    await sendRefundsList(ctx);
+  });
+
+  async function sendRefundsList(ctx) {
+    const orders = await fb.getAllOrders();
+    const pending = Object.entries(orders).filter(([, o]) => o.refundStatus === 'requested');
+
+    let text = `↩️ *Pending Refund Requests* (${pending.length})\n\n`;
+    if (pending.length === 0) text += '_No pending refund requests._';
+
+    const buttons = pending.slice(0, 15).map(([id, o]) => [
+      Markup.button.callback(`${o.productName} — ₹${o.amount} (${o.userId})`, `admin_refund_${id}`)
+    ]);
+    buttons.push([Markup.button.callback('⬅️ Back', 'admin_home')]);
+
+    try { await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+    catch (e) { await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+  }
+
+  bot.action(/^admin_refund_(.+)$/, async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    const orderId = ctx.match[1];
+    const order = await fb.getOrder(orderId);
+    if (!order) return ctx.answerCbQuery('Not found.');
+    await ctx.answerCbQuery();
+
+    const text = `↩️ *Refund Request*\n\n📦 ${mdEscape(order.productName)}\n💰 ₹${order.amount}\n👤 User: \`${order.userId}\`\n📝 Reason: ${mdEscape(order.refundReason || 'not given')}`;
+    await ctx.reply(text, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Approve (refund to wallet)', `admin_approverefund_${orderId}`)],
+        [Markup.button.callback('❌ Reject', `admin_rejectrefund_${orderId}`)],
+        [Markup.button.callback('⬅️ Back', 'admin_refunds')]
+      ])
+    });
+  });
+
+  bot.action(/^admin_approverefund_(.+)$/, async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    const orderId = ctx.match[1];
+    await fb.processRefund(orderId, true);
+    await ctx.answerCbQuery('✅ Refund approved');
+    await ctx.editMessageText('✅ Refund approved and credited to user\'s wallet.', adminBackButton('admin_refunds'));
+  });
+
+  bot.action(/^admin_rejectrefund_(.+)$/, async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    const orderId = ctx.match[1];
+    await fb.processRefund(orderId, false);
+    await ctx.answerCbQuery('❌ Refund rejected');
+    await ctx.editMessageText('❌ Refund request rejected.', adminBackButton('admin_refunds'));
   });
 
   // ============ COUPONS ============
 
   bot.action('admin_coupons', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery();
     await sendCouponsList(ctx);
   });
@@ -320,7 +399,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   }
 
   bot.action(/^admin_coupon_(.+)$/, async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     const code = ctx.match[1];
     const coupon = await fb.getCoupon(code);
     if (!coupon) return ctx.answerCbQuery('Not found.');
@@ -335,7 +414,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   });
 
   bot.action(/^admin_togglecoupon_(.+)$/, async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     const code = ctx.match[1];
     const coupon = await fb.getCoupon(code);
     if (!coupon) return ctx.answerCbQuery('Not found.');
@@ -345,25 +424,44 @@ function setupAdminPanel(bot, fb, mdEscape) {
   });
 
   bot.action('admin_addcoupon', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery();
     adminState[ctx.from.id] = { step: 'coupon_code', data: {} };
     await ctx.reply('🎟 *New Coupon*\n\nStep 1/4 — Coupon code? (e.g. WELCOME50)', { parse_mode: 'Markdown' });
   });
 
+  // ============ REFERRAL SETTINGS ============
+
+  bot.action('admin_referral', async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    await ctx.answerCbQuery();
+    const settings = await fb.getReferralSettings();
+    await ctx.reply(
+      `🔗 *Referral Settings*\n\nBonus Type: ${settings.bonusType}\nBonus Amount: ${settings.bonusType === 'percent' ? settings.bonusAmount + '%' : '₹' + settings.bonusAmount}`,
+      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('✏️ Edit', 'admin_editreferral')], [Markup.button.callback('⬅️ Back', 'admin_home')]]) }
+    );
+  });
+
+  bot.action('admin_editreferral', async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    await ctx.answerCbQuery();
+    adminState[ctx.from.id] = { step: 'referral_type', data: {} };
+    await ctx.reply('Bonus type? Reply "flat" (₹) or "percent" (%)', Markup.keyboard(['flat', 'percent']).oneTime().resize());
+  });
+
   // ============ BROADCAST ============
 
   bot.action('admin_broadcast', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery();
-    adminState[ctx.from.id] = { step: 'broadcast_message', data: {} };
+    adminState[ctx.from.id] = { step: 'bc_message', data: {} };
     await ctx.reply('📢 *Broadcast*\n\nType the message to send to all users:', { parse_mode: 'Markdown', ...adminBackButton('admin_home') });
   });
 
   // ============ DIRECT MESSAGE ============
 
   bot.action('admin_dm', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery();
     adminState[ctx.from.id] = { step: 'dm_userid', data: {} };
     await ctx.reply('📩 *Direct Message*\n\nEnter the Telegram ID to message:', { parse_mode: 'Markdown', ...adminBackButton('admin_home') });
@@ -372,7 +470,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   // ============ BOT SETTINGS ============
 
   bot.action('admin_settings', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isOwner(ctx))) return;
     await ctx.answerCbQuery();
     const settings = await fb.getBotSettings();
     const text = `⚙️ *Bot Settings*\n\n🛠 Maintenance: ${settings.maintenanceMode ? 'ON 🔴' : 'OFF 🟢'}\n📢 Required Channels: ${(settings.channels || []).filter(c => c.required).length}\n💬 Support TG: ${settings.supportTelegram ? '@' + mdEscape(settings.supportTelegram) : 'not set'}\n📱 Support WA: ${settings.supportWhatsapp || 'not set'}`;
@@ -392,43 +490,312 @@ function setupAdminPanel(bot, fb, mdEscape) {
   });
 
   bot.action('admin_setwelcome', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isOwner(ctx))) return;
     await ctx.answerCbQuery();
     adminState[ctx.from.id] = { step: 'awaiting_welcome_message' };
     await ctx.reply('✏️ Send the new welcome message. Use {name} for the user\'s first name:');
   });
 
   bot.action('admin_togglemaintenance', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isOwner(ctx))) return;
     const settings = await fb.getBotSettings();
     await fb.updateBotSettings({ maintenanceMode: !settings.maintenanceMode });
     await ctx.answerCbQuery(settings.maintenanceMode ? '🟢 Maintenance OFF' : '🔴 Maintenance ON');
   });
 
   bot.action('admin_channels', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isOwner(ctx))) return;
     await ctx.answerCbQuery();
+    await sendChannelsMenu(ctx);
+  });
+
+  async function sendChannelsMenu(ctx) {
     const settings = await fb.getBotSettings();
     const channels = settings.channels || [];
     let text = '📢 *Required Channels*\n\n';
-    channels.forEach((c, i) => { text += `${i + 1}. @${c.username} ${c.required ? '(required)' : '(optional)'}\n`; });
     if (channels.length === 0) text += '_None set._';
 
+    const buttons = channels.map((c, i) => [
+      Markup.button.callback(`${c.required ? '✅' : '⬜'} @${c.username}`, `admin_togglechannel_${i}`),
+      Markup.button.callback('🗑', `admin_removechannel_${i}`)
+    ]);
+    buttons.push([Markup.button.callback('➕ Add Channel', 'admin_addchannel')]);
+    buttons.push([Markup.button.callback('⬅️ Back', 'admin_settings')]);
+
+    try { await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+    catch (e) { await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+  }
+
+  bot.action('admin_addchannel', async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    await ctx.answerCbQuery();
     adminState[ctx.from.id] = { step: 'awaiting_channel_username', data: {} };
-    await ctx.reply(text + '\n\nSend a channel username (without @) to add it as required:', { parse_mode: 'Markdown', ...adminBackButton('admin_settings') });
+    await ctx.reply('Send a channel username (without @) to add it as required. Make sure the bot is an admin in that channel!');
+  });
+
+  bot.action(/^admin_togglechannel_(\d+)$/, async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    const idx = parseInt(ctx.match[1]);
+    const settings = await fb.getBotSettings();
+    const channels = settings.channels || [];
+    if (channels[idx]) channels[idx].required = !channels[idx].required;
+    await fb.updateBotSettings({ channels });
+    await ctx.answerCbQuery('Updated');
+    await sendChannelsMenu(ctx);
+  });
+
+  bot.action(/^admin_removechannel_(\d+)$/, async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    const idx = parseInt(ctx.match[1]);
+    const settings = await fb.getBotSettings();
+    const channels = settings.channels || [];
+    channels.splice(idx, 1);
+    await fb.updateBotSettings({ channels });
+    await ctx.answerCbQuery('🗑️ Removed');
+    await sendChannelsMenu(ctx);
   });
 
   bot.action('admin_setsupport', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isOwner(ctx))) return;
     await ctx.answerCbQuery();
     adminState[ctx.from.id] = { step: 'awaiting_support_telegram', data: {} };
     await ctx.reply('💬 Send support Telegram username (without @), or "skip":');
   });
 
+  // ============ MENU BUTTONS MANAGER ============
+
+  const MENU_LABEL_KEYS = {
+    profile: '👤 My Profile', browse: '🛍 Browse Products', free: '🎁 Free Products',
+    proplan: '👑 Pro Plan', purchases: '📦 My Purchases', orders: '📋 Order Status',
+    referrals: '🔗 My Referrals', stats: '📊 My Stats', paymenthistory: '🧾 Payment History',
+    support: '📞 Support', language: '🌐 Hindi / English', checkin: '🎯 Daily Check-in',
+    leaderboard: '🏆 Leaderboard'
+  };
+
+  bot.action('admin_menubuttons', async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    await ctx.answerCbQuery();
+    await sendMenuButtonsMenu(ctx);
+  });
+
+  async function sendMenuButtonsMenu(ctx) {
+    const settings = await fb.getBotSettings();
+    const customButtons = settings.menuCustomButtons || [];
+
+    let text = '🔘 *Menu Buttons Manager*\n\nRename any built-in button, or add unlimited custom link buttons to the main menu.';
+
+    const buttons = [
+      [Markup.button.callback('✏️ Rename Built-in Buttons', 'admin_renamebuttons')],
+      [Markup.button.callback('➕ Add Custom Link Button', 'admin_addmenubutton')]
+    ];
+    customButtons.forEach((btn, i) => {
+      buttons.push([Markup.button.callback(`🔗 ${btn.text}`, 'noop'), Markup.button.callback('🗑', `admin_removemenubutton_${i}`)]);
+    });
+    buttons.push([Markup.button.callback('⬅️ Back', 'admin_home')]);
+
+    try { await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+    catch (e) { await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+  }
+
+  bot.action('noop', async (ctx) => { await ctx.answerCbQuery(); });
+
+  bot.action('admin_renamebuttons', async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    await ctx.answerCbQuery();
+    const settings = await fb.getBotSettings();
+    const labels = { ...MENU_LABEL_KEYS, ...(settings.menuLabels || {}) };
+
+    const buttons = Object.keys(MENU_LABEL_KEYS).map(key => [Markup.button.callback(labels[key], `admin_renamebtn_${key}`)]);
+    buttons.push([Markup.button.callback('⬅️ Back', 'admin_menubuttons')]);
+    await ctx.reply('Tap a button to rename it:', Markup.inlineKeyboard(buttons));
+  });
+
+  bot.action(/^admin_renamebtn_(.+)$/, async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    const key = ctx.match[1];
+    await ctx.answerCbQuery();
+    adminState[ctx.from.id] = { step: 'awaiting_button_rename', data: { key } };
+    await ctx.reply(`New label for this button? (include emoji if you want one)`);
+  });
+
+  bot.action('admin_addmenubutton', async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    await ctx.answerCbQuery();
+    adminState[ctx.from.id] = { step: 'menubutton_text', data: {} };
+    await ctx.reply('🔗 Button text? (e.g. "Join Community")');
+  });
+
+  bot.action(/^admin_removemenubutton_(\d+)$/, async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    const idx = parseInt(ctx.match[1]);
+    const settings = await fb.getBotSettings();
+    const customButtons = settings.menuCustomButtons || [];
+    customButtons.splice(idx, 1);
+    await fb.updateBotSettings({ menuCustomButtons: customButtons });
+    await ctx.answerCbQuery('🗑️ Removed');
+    await sendMenuButtonsMenu(ctx);
+  });
+
+  // ============ DAILY CHECK-IN SETTINGS ============
+
+  bot.action('admin_checkin', async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    await ctx.answerCbQuery();
+    const settings = await fb.getCheckInSettings();
+    await ctx.reply(
+      `🎯 *Daily Check-in*\n\nStatus: ${settings.active ? '✅ Active' : '🚫 Disabled'}\nBase Reward: ₹${settings.rewardAmount}`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback(settings.active ? '🚫 Disable' : '✅ Enable', 'admin_togglecheckin')],
+          [Markup.button.callback('✏️ Edit Reward', 'admin_editcheckinreward')],
+          [Markup.button.callback('⬅️ Back', 'admin_home')]
+        ])
+      }
+    );
+  });
+
+  bot.action('admin_togglecheckin', async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    const settings = await fb.getCheckInSettings();
+    await fb.setCheckInSettings({ ...settings, active: !settings.active });
+    await ctx.answerCbQuery(settings.active ? '🚫 Disabled' : '✅ Enabled');
+  });
+
+  bot.action('admin_editcheckinreward', async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    await ctx.answerCbQuery();
+    adminState[ctx.from.id] = { step: 'awaiting_checkin_reward', data: {} };
+    await ctx.reply('💰 New base reward amount (₹)?');
+  });
+
+  // ============ MESSAGE HISTORY ============
+
+  bot.action('admin_msghistory', async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    await ctx.answerCbQuery();
+    await ctx.reply('📜 *Message History*\n\nChoose which history to view:', {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('📩 DM History', 'admin_dmhistory_0')],
+        [Markup.button.callback('📢 Broadcast History', 'admin_bchistory_0')],
+        [Markup.button.callback('⬅️ Back', 'admin_home')]
+      ])
+    });
+  });
+
+  bot.action(/^admin_dmhistory_(\d+)$/, async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    const page = parseInt(ctx.match[1]);
+    await ctx.answerCbQuery();
+    const queue = await fb.getDmQueue();
+    const entries = Object.entries(queue).sort((a, b) => (b[1].createdAt || 0) - (a[1].createdAt || 0));
+    const pageSize = 5;
+    const pageItems = entries.slice(page * pageSize, (page + 1) * pageSize);
+
+    let text = `📩 *DM History* (${entries.length} total)\n\n`;
+    if (pageItems.length === 0) text += '_No messages yet._';
+    const buttons = [];
+    pageItems.forEach(([id, d]) => {
+      const status = d.sent ? (d.success !== false ? '✅' : '❌') : '⏳';
+      const seen = d.seen ? '👁' : '';
+      text += `${status}${seen} \`${d.userId}\` — ${(d.message || '').slice(0, 40)}\n`;
+      if (d.sentChatId && !d.deleted) buttons.push([Markup.button.callback(`🗑 Unsend to ${d.userId}`, `admin_unsenddm_${id}`)]);
+    });
+    const navRow = [];
+    if (page > 0) navRow.push(Markup.button.callback('⬅️ Prev', `admin_dmhistory_${page - 1}`));
+    if ((page + 1) * pageSize < entries.length) navRow.push(Markup.button.callback('Next ➡️', `admin_dmhistory_${page + 1}`));
+    if (navRow.length) buttons.push(navRow);
+    buttons.push([Markup.button.callback('⬅️ Back', 'admin_msghistory')]);
+
+    try { await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+    catch (e) { await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+  });
+
+  bot.action(/^admin_unsenddm_(.+)$/, async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    const id = ctx.match[1];
+    await fb.updateDmEntry(id, { deleteRequested: true });
+    await ctx.answerCbQuery('📤 Unsend requested — processing...');
+  });
+
+  bot.action(/^admin_bchistory_(\d+)$/, async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    const page = parseInt(ctx.match[1]);
+    await ctx.answerCbQuery();
+    const queue = await fb.getBroadcastQueue();
+    const entries = Object.entries(queue).sort((a, b) => (b[1].createdAt || 0) - (a[1].createdAt || 0));
+    const pageSize = 5;
+    const pageItems = entries.slice(page * pageSize, (page + 1) * pageSize);
+
+    let text = `📢 *Broadcast History* (${entries.length} total)\n\n`;
+    if (pageItems.length === 0) text += '_No broadcasts yet._';
+    const buttons = [];
+    pageItems.forEach(([id, b]) => {
+      const status = b.sent ? `✅ ${b.sentCount ?? 0}/${b.targetCount ?? '?'}` : '⏳ sending...';
+      text += `${status} 👁${b.seenCount || 0} — ${(b.message || '').slice(0, 35)}\n`;
+      if (b.sentMessages && !b.deleted) buttons.push([Markup.button.callback('🗑 Unsend from everyone', `admin_unsendbc_${id}`)]);
+    });
+    const navRow = [];
+    if (page > 0) navRow.push(Markup.button.callback('⬅️ Prev', `admin_bchistory_${page - 1}`));
+    if ((page + 1) * pageSize < entries.length) navRow.push(Markup.button.callback('Next ➡️', `admin_bchistory_${page + 1}`));
+    if (navRow.length) buttons.push(navRow);
+    buttons.push([Markup.button.callback('⬅️ Back', 'admin_msghistory')]);
+
+    try { await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+    catch (e) { await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+  });
+
+  bot.action(/^admin_unsendbc_(.+)$/, async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    const id = ctx.match[1];
+    await fb.updateBroadcastEntry(id, { deleteRequested: true });
+    await ctx.answerCbQuery('📤 Unsend requested — processing for all recipients...');
+  });
+
+  // ============ STAFF SYSTEM ============
+
+  bot.action('admin_staff', async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    await ctx.answerCbQuery();
+    await sendStaffMenu(ctx);
+  });
+
+  async function sendStaffMenu(ctx) {
+    const staff = await fb.getAllStaff();
+    const entries = Object.entries(staff);
+
+    let text = `🧑‍💼 *Staff* (${entries.length})\n\nStaff can access Products, Orders, Users, Refunds, Coupons, Broadcast, and Message History — but not Bot Settings, Pro Plan, Menu Buttons, Check-in settings, or Staff management.\n\n`;
+    if (entries.length === 0) text += '_No staff added yet._';
+    entries.forEach(([id, s]) => { text += `👤 \`${id}\`\n`; });
+
+    const buttons = [[Markup.button.callback('➕ Add Staff', 'admin_addstaff')]];
+    entries.forEach(([id]) => buttons.push([Markup.button.callback(`🗑 Remove ${id}`, `admin_removestaff_${id}`)]));
+    buttons.push([Markup.button.callback('⬅️ Back', 'admin_home')]);
+
+    try { await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+    catch (e) { await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+  }
+
+  bot.action('admin_addstaff', async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    await ctx.answerCbQuery();
+    adminState[ctx.from.id] = { step: 'awaiting_staff_id', data: {} };
+    await ctx.reply('🧑‍💼 Enter the Telegram ID to make staff:');
+  });
+
+  bot.action(/^admin_removestaff_(.+)$/, async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    const id = ctx.match[1];
+    await fb.removeStaff(id);
+    await ctx.answerCbQuery('🗑️ Removed');
+    await sendStaffMenu(ctx);
+  });
+
   // ============ PRO PLAN ============
 
   bot.action('admin_proplan', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isOwner(ctx))) return;
     await ctx.answerCbQuery();
     const settings = await fb.getProPlanSettings();
     await ctx.reply(`👑 *Pro Plan Settings*\n\n💰 Price: ₹${settings.price}\n📅 Duration: ${settings.durationDays} days`, {
@@ -441,7 +808,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   });
 
   bot.action('admin_editproplan', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isOwner(ctx))) return;
     await ctx.answerCbQuery();
     adminState[ctx.from.id] = { step: 'proplan_price', data: {} };
     await ctx.reply('👑 New price (₹)?');
@@ -450,7 +817,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   // ============ SALES REPORT ============
 
   bot.action('admin_report', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery();
     const weekly = await fb.getSalesReport(7);
     const monthly = await fb.getSalesReport(30);
@@ -461,7 +828,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   // ============ LEADERBOARD ============
 
   bot.action('admin_leaderboard', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery();
     const [buyers, referrers] = await Promise.all([fb.getTopBuyers(5), fb.getTopReferrers(5)]);
     let text = '🏆 *Leaderboard*\n\n💰 *Top Buyers*\n';
@@ -474,7 +841,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
   // ============ BACKUP ============
 
   bot.action('admin_backup', async (ctx) => {
-    if (!isAdmin(ctx)) return;
+    if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery('Generating backup...');
     const backup = fb.getFullBackup();
     const json = JSON.stringify(backup, null, 2);
@@ -544,20 +911,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
       return true;
     }
 
-    if (state.step === 'awaiting_dm_message') {
-      await fb.queueDm({ userId: state.data.telegramId, message: text });
-      delete adminState[ctx.from.id];
-      await ctx.reply('📩 Message queued — sending shortly.');
-      return true;
-    }
-
-    if (state.step === 'broadcast_message') {
-      await fb.queueBroadcast({ message: text });
-      delete adminState[ctx.from.id];
-      await ctx.reply('📢 Broadcast queued — sending to all users shortly.');
-      return true;
-    }
-
+    // ---- Direct Message wizard: userid -> message -> image? -> file? -> button? -> popup? -> send
     if (state.step === 'dm_userid') {
       state.data.telegramId = text;
       state.step = 'dm_message';
@@ -565,9 +919,97 @@ function setupAdminPanel(bot, fb, mdEscape) {
       return true;
     }
     if (state.step === 'dm_message') {
-      await fb.queueDm({ userId: state.data.telegramId, message: text });
+      state.data.message = text;
+      state.step = 'dm_image';
+      await ctx.reply('🖼 Send a photo to attach (or type "skip"):');
+      return true;
+    }
+    if (state.step === 'dm_image') {
+      if (text.toLowerCase() === 'skip') {
+        state.step = 'dm_file';
+        await ctx.reply('📎 Send a file to attach (or type "skip"):');
+        return true;
+      }
+      await ctx.reply('⚠️ Send a photo, or type "skip".');
+      return true;
+    }
+    if (state.step === 'dm_file') {
+      if (text.toLowerCase() === 'skip') {
+        state.step = 'dm_button';
+        await ctx.reply('🔗 Add a button? Send as `Button Text | https://url.com`, or type "skip":', { parse_mode: 'Markdown' });
+        return true;
+      }
+      await ctx.reply('⚠️ Send a file, or type "skip".');
+      return true;
+    }
+    if (state.step === 'dm_button') {
+      if (text.toLowerCase() !== 'skip') {
+        const parts = text.split('|').map(s => s.trim());
+        if (parts.length === 2) { state.data.buttonText = parts[0]; state.data.buttonUrl = parts[1]; }
+      }
+      state.step = 'dm_popup';
+      await ctx.reply('🔔 Send as popup notification (with a Close ❌ button)? Reply "yes" or "no":', Markup.keyboard(['yes', 'no']).oneTime().resize());
+      return true;
+    }
+    if (state.step === 'dm_popup') {
+      state.data.isPopup = text.toLowerCase() === 'yes';
+      await fb.queueDm({
+        userId: state.data.telegramId, message: state.data.message,
+        imageIds: state.data.imageId ? [state.data.imageId] : null,
+        fileIds: state.data.fileId ? [state.data.fileId] : null,
+        buttonText: state.data.buttonText || null, buttonUrl: state.data.buttonUrl || null,
+        isPopup: state.data.isPopup
+      });
       delete adminState[ctx.from.id];
-      await ctx.reply('📩 Message queued.');
+      await ctx.reply('📩 Message queued — sending shortly.', Markup.removeKeyboard());
+      return true;
+    }
+
+    // ---- Broadcast wizard: message -> image? -> file? -> button? -> popup? -> send
+    if (state.step === 'bc_message') {
+      state.data.message = text;
+      state.step = 'bc_image';
+      await ctx.reply('🖼 Send a photo to attach (or type "skip"):');
+      return true;
+    }
+    if (state.step === 'bc_image') {
+      if (text.toLowerCase() === 'skip') {
+        state.step = 'bc_file';
+        await ctx.reply('📎 Send a file to attach (or type "skip"):');
+        return true;
+      }
+      await ctx.reply('⚠️ Send a photo, or type "skip".');
+      return true;
+    }
+    if (state.step === 'bc_file') {
+      if (text.toLowerCase() === 'skip') {
+        state.step = 'bc_button';
+        await ctx.reply('🔗 Add a button? Send as `Button Text | https://url.com`, or type "skip":', { parse_mode: 'Markdown' });
+        return true;
+      }
+      await ctx.reply('⚠️ Send a file, or type "skip".');
+      return true;
+    }
+    if (state.step === 'bc_button') {
+      if (text.toLowerCase() !== 'skip') {
+        const parts = text.split('|').map(s => s.trim());
+        if (parts.length === 2) { state.data.buttonText = parts[0]; state.data.buttonUrl = parts[1]; }
+      }
+      state.step = 'bc_popup';
+      await ctx.reply('🔔 Send as popup notification (with a Close ❌ button)? Reply "yes" or "no":', Markup.keyboard(['yes', 'no']).oneTime().resize());
+      return true;
+    }
+    if (state.step === 'bc_popup') {
+      state.data.isPopup = text.toLowerCase() === 'yes';
+      await fb.queueBroadcast({
+        message: state.data.message,
+        imageIds: state.data.imageId ? [state.data.imageId] : null,
+        fileIds: state.data.fileId ? [state.data.fileId] : null,
+        buttonText: state.data.buttonText || null, buttonUrl: state.data.buttonUrl || null,
+        isPopup: state.data.isPopup
+      });
+      delete adminState[ctx.from.id];
+      await ctx.reply('📢 Broadcast queued — sending to all users shortly.', Markup.removeKeyboard());
       return true;
     }
 
@@ -609,6 +1051,70 @@ function setupAdminPanel(bot, fb, mdEscape) {
     if (state.step === 'awaiting_user_lookup') {
       delete adminState[ctx.from.id];
       await sendUserDetails(ctx, text);
+      return true;
+    }
+
+    // ---- Menu button rename ----
+    if (state.step === 'awaiting_button_rename') {
+      const settings = await fb.getBotSettings();
+      const menuLabels = { ...(settings.menuLabels || {}) };
+      menuLabels[state.data.key] = text;
+      await fb.updateBotSettings({ menuLabels });
+      delete adminState[ctx.from.id];
+      await ctx.reply(`✅ Button renamed to "${text}"`);
+      return true;
+    }
+
+    // ---- Add custom menu button wizard ----
+    if (state.step === 'menubutton_text') {
+      state.data.text = text;
+      state.step = 'menubutton_url';
+      await ctx.reply('🔗 Button URL?');
+      return true;
+    }
+    if (state.step === 'menubutton_url') {
+      const settings = await fb.getBotSettings();
+      const customButtons = [...(settings.menuCustomButtons || []), { text: state.data.text, url: text }];
+      await fb.updateBotSettings({ menuCustomButtons: customButtons });
+      delete adminState[ctx.from.id];
+      await ctx.reply(`✅ Custom button "${state.data.text}" added to main menu.`);
+      return true;
+    }
+
+    // ---- Check-in reward edit ----
+    if (state.step === 'awaiting_checkin_reward') {
+      const amount = parseInt(text);
+      if (isNaN(amount) || amount < 0) { await ctx.reply('⚠️ Valid amount daalo.'); return true; }
+      const settings = await fb.getCheckInSettings();
+      await fb.setCheckInSettings({ ...settings, rewardAmount: amount });
+      delete adminState[ctx.from.id];
+      await ctx.reply(`✅ Check-in reward set to ₹${amount}.`);
+      return true;
+    }
+
+    // ---- Add staff ----
+    if (state.step === 'awaiting_staff_id') {
+      await fb.addStaff(text, ['products', 'orders', 'users', 'coupons', 'broadcast']);
+      delete adminState[ctx.from.id];
+      await ctx.reply(`✅ User \`${text}\` added as staff.`, { parse_mode: 'Markdown' });
+      return true;
+    }
+
+    // ---- Referral settings wizard ----
+    if (state.step === 'referral_type') {
+      const type = text.toLowerCase();
+      if (type !== 'flat' && type !== 'percent') { await ctx.reply('⚠️ Reply "flat" or "percent".'); return true; }
+      state.data.bonusType = type;
+      state.step = 'referral_amount';
+      await ctx.reply(`Bonus amount? (${type === 'flat' ? '₹' : '%'})`, Markup.removeKeyboard());
+      return true;
+    }
+    if (state.step === 'referral_amount') {
+      const amount = parseInt(text);
+      if (isNaN(amount)) { await ctx.reply('⚠️ Valid number daalo.'); return true; }
+      await fb.setReferralSettings({ bonusType: state.data.bonusType, bonusAmount: amount });
+      delete adminState[ctx.from.id];
+      await ctx.reply(`✅ Referral bonus set: ${state.data.bonusType === 'percent' ? amount + '%' : '₹' + amount}`);
       return true;
     }
 
@@ -763,20 +1269,57 @@ function setupAdminPanel(bot, fb, mdEscape) {
   // Called from bot.js's document/photo handlers when an admin is mid-wizard
   async function handleAdminDocument(ctx) {
     const state = adminState[ctx.from.id];
-    if (!state || state.step !== 'prod_deliveryvalue' || state.data.deliveryType !== 'file') return false;
-    state.data.fileId = ctx.message.document.file_id;
-    state.step = 'prod_image';
-    await ctx.reply('✅ File saved.\n\nStep 8/8 — Send a product image (photo), or type "skip":');
-    return true;
+    if (!state) return false;
+
+    if (state.step === 'prod_deliveryvalue' && state.data.deliveryType === 'file') {
+      state.data.fileId = ctx.message.document.file_id;
+      state.step = 'prod_image';
+      await ctx.reply('✅ File saved.\n\nStep 8/8 — Send a product image (photo), or type "skip":');
+      return true;
+    }
+
+    if (state.step === 'dm_file') {
+      state.data.fileId = ctx.message.document.file_id;
+      state.step = 'dm_button';
+      await ctx.reply('✅ File attached.\n\n🔗 Add a button? Send as `Button Text | https://url.com`, or type "skip":', { parse_mode: 'Markdown' });
+      return true;
+    }
+    if (state.step === 'bc_file') {
+      state.data.fileId = ctx.message.document.file_id;
+      state.step = 'bc_button';
+      await ctx.reply('✅ File attached.\n\n🔗 Add a button? Send as `Button Text | https://url.com`, or type "skip":', { parse_mode: 'Markdown' });
+      return true;
+    }
+
+    return false;
   }
 
   async function handleAdminPhoto(ctx) {
     const state = adminState[ctx.from.id];
-    if (!state || state.step !== 'prod_image') return false;
+    if (!state) return false;
     const sizes = ctx.message.photo;
-    state.data.imageFileId = sizes[sizes.length - 1].file_id;
-    await finalizeProduct(ctx, state);
-    return true;
+    const fileId = sizes[sizes.length - 1].file_id;
+
+    if (state.step === 'prod_image') {
+      state.data.imageFileId = fileId;
+      await finalizeProduct(ctx, state);
+      return true;
+    }
+
+    if (state.step === 'dm_image') {
+      state.data.imageId = fileId;
+      state.step = 'dm_file';
+      await ctx.reply('✅ Photo attached.\n\n📎 Send a file to attach (or type "skip"):');
+      return true;
+    }
+    if (state.step === 'bc_image') {
+      state.data.imageId = fileId;
+      state.step = 'bc_file';
+      await ctx.reply('✅ Photo attached.\n\n📎 Send a file to attach (or type "skip"):');
+      return true;
+    }
+
+    return false;
   }
 
   return { handleAdminText, handleAdminDocument, handleAdminPhoto, isAdmin, adminState };
