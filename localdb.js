@@ -597,4 +597,334 @@ async function getBotSettings() {
   };
 }
 
-async function updateBotSetting
+async function updateBotSettings(updates) {
+  return updateCollectionAtomic('botSettings', (current) => {
+    const hasData = Object.keys(current).length > 0;
+    const base = hasData ? current : {
+      welcomeMessage: '✨ *Welcome, {name}!* ✨\n\n💎 Quality you can count on, delivery you can rely on.\n\n🛍 *Curated Products* — paid & free\n💳 *Secure Payments* via UPI\n⚡ *Instant Delivery* after payment\n🛡 *Dedicated Support*, whenever you need it\n\n👇 Select an option below to begin',
+      channels: [], supportTelegram: '', supportWhatsapp: '', botName: '', botDescription: '',
+      maintenanceMode: false, maintenanceMessage: '🛠 Bot abhi maintenance mein hai. Thodi der baad try karo.',
+      menuCustomButtons: [], menuLabels: {}
+    };
+    const merged = { ...base, ...updates };
+    return { __replaceWith: merged, __value: merged };
+  });
+}
+
+// ================= DAILY CHECK-IN =================
+
+async function getCheckInSettings() {
+  const s = readCollection('checkInSettings');
+  return Object.keys(s).length ? s : { active: true, rewardAmount: 5 };
+}
+
+async function setCheckInSettings(data) {
+  await writeCollection('checkInSettings', data);
+}
+
+async function performCheckIn(telegramId) {
+  const settings = await getCheckInSettings();
+  if (!settings.active) return { success: false, reason: 'disabled' };
+
+  const user = await getUser(telegramId);
+  const today = new Date().toDateString();
+  const lastCheckIn = user?.lastCheckInDate;
+
+  if (lastCheckIn === today) {
+    return { success: false, reason: 'already_checked_in', streak: user.checkInStreak || 0 };
+  }
+
+  const yesterday = new Date(Date.now() - 86400000).toDateString();
+  const streak = (lastCheckIn === yesterday) ? (user.checkInStreak || 0) + 1 : 1;
+
+  telegramId = String(telegramId);
+  await updateCollectionAtomic('users', (users) => {
+    if (!users[telegramId]) return;
+    users[telegramId].lastCheckInDate = today;
+    users[telegramId].checkInStreak = streak;
+  });
+
+  const bonus = Math.min(settings.rewardAmount * Math.ceil(streak / 3), settings.rewardAmount * 5);
+  await creditWallet(telegramId, bonus, 'daily_checkin');
+
+  return { success: true, streak, bonus };
+}
+
+// ================= LEADERBOARD =================
+
+async function getTopBuyers(limit = 10) {
+  const orders = readCollection('orders');
+  const spendByUser = {};
+  Object.values(orders).forEach(o => {
+    if (o.status === 'paid' || o.status === 'delivered') {
+      spendByUser[o.userId] = (spendByUser[o.userId] || 0) + (o.amount || 0);
+    }
+  });
+
+  const users = readCollection('users');
+  return Object.entries(spendByUser)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([uid, spent]) => ({ telegramId: uid, name: users[uid]?.name || 'Unknown', totalSpent: spent }));
+}
+
+async function getTopReferrers(limit = 10) {
+  const users = readCollection('users');
+  const referralCounts = {};
+  Object.entries(users).forEach(([uid, u]) => {
+    if (u.referredBy) referralCounts[u.referredBy] = (referralCounts[u.referredBy] || 0) + 1;
+  });
+
+  return Object.entries(referralCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([uid, count]) => ({ telegramId: uid, name: users[uid]?.name || 'Unknown', referralCount: count }));
+}
+
+// ================= USER ANALYTICS =================
+
+async function getUserAnalytics(telegramId) {
+  const user = await getUser(telegramId);
+  if (!user) return null;
+
+  const orders = await getUserOrders(telegramId);
+  const orderList = Object.values(orders);
+  const paidOrders = orderList.filter(o => o.status === 'paid' || o.status === 'delivered');
+  const totalSpent = paidOrders.reduce((sum, o) => sum + (o.amount || 0), 0);
+
+  const allUsers = await getAllUsers();
+  const referredCount = Object.values(allUsers).filter(u => u.referredBy === String(telegramId)).length;
+
+  return { ...user, totalOrders: orderList.length, completedOrders: paidOrders.length, totalSpent, referredCount };
+}
+
+// ================= BROADCAST / DM QUEUES =================
+// bot.js originally listened to Firebase's real-time child_added/child_changed
+// events for these. Local mode has no such push mechanism, so bot.js uses
+// these direct functions instead (see the updated queue-processing section).
+
+async function queueBroadcast(data) {
+  const id = generateId('bc_');
+  await updateCollectionAtomic('broadcastQueue', (queue) => {
+    queue[id] = { ...data, id, sent: false, createdAt: Date.now() };
+  });
+  return id;
+}
+
+async function queueDm(data) {
+  const id = generateId('dm_');
+  await updateCollectionAtomic('dmQueue', (queue) => {
+    queue[id] = { ...data, id, sent: false, createdAt: Date.now() };
+  });
+  return id;
+}
+
+async function getBroadcastQueue() { return readCollection('broadcastQueue'); }
+async function getDmQueue() { return readCollection('dmQueue'); }
+
+async function updateBroadcastEntry(id, updates) {
+  await updateCollectionAtomic('broadcastQueue', (queue) => {
+    if (!queue[id]) return;
+    queue[id] = { ...queue[id], ...updates };
+  });
+}
+
+async function updateDmEntry(id, updates) {
+  await updateCollectionAtomic('dmQueue', (queue) => {
+    if (!queue[id]) return;
+    queue[id] = { ...queue[id], ...updates };
+  });
+}
+
+async function deleteBroadcastEntry(id) {
+  await updateCollectionAtomic('broadcastQueue', (queue) => {
+    delete queue[id];
+  });
+}
+
+async function deleteDmEntry(id) {
+  await updateCollectionAtomic('dmQueue', (queue) => {
+    delete queue[id];
+  });
+}
+
+// ================= BACKUP / RESTORE =================
+// Since local storage can vanish on redeploy, these let an admin export
+// everything to a single JSON file (and re-import it after a redeploy).
+
+function getFullBackup() {
+  const backup = {};
+  for (const key of Object.keys(FILES)) {
+    backup[key] = readCollection(key);
+  }
+  backup._exportedAt = new Date().toISOString();
+  return backup;
+}
+
+async function restoreFromBackup(backupObj) {
+  for (const key of Object.keys(FILES)) {
+    if (backupObj[key]) {
+      await writeCollection(key, backupObj[key]);
+    }
+  }
+}
+
+// ================= ADMIN CHECK =================
+
+function isAdmin(telegramId) {
+  const adminIds = (process.env.ADMIN_TELEGRAM_IDS || '').split(',').map(s => s.trim());
+  return adminIds.includes(String(telegramId));
+}
+
+// ================= MISC USER FIELD HELPERS =================
+// Generic get/set for one-off per-user fields bot.js needs (seen-tracking
+// markers, pending deep-link state) — avoids needing a dedicated function
+// for every small piece of transient state.
+
+async function setUserField(telegramId, field, value) {
+  telegramId = String(telegramId);
+  await updateCollectionAtomic('users', (users) => {
+    if (!users[telegramId]) return;
+    users[telegramId][field] = value;
+  });
+}
+
+async function getUserField(telegramId, field) {
+  const user = await getUser(telegramId);
+  return user ? user[field] : undefined;
+}
+
+async function clearUserField(telegramId, field) {
+  await setUserField(telegramId, field, null);
+}
+
+async function getUserWalletTransactions(telegramId) {
+  const txns = readCollection('walletTransactions');
+  telegramId = String(telegramId);
+  return Object.values(txns).filter(t => String(t.userId) === telegramId);
+}
+
+async function getPendingOrdersByMethod(paymentMethod, sinceTimestamp) {
+  const orders = readCollection('orders');
+  return Object.entries(orders).filter(([id, o]) =>
+    o.status === 'pending' &&
+    o.paymentMethod === paymentMethod &&
+    (!sinceTimestamp || o.createdAt >= sinceTimestamp)
+  );
+}
+
+// ================= STAFF SYSTEM =================
+// Staff are non-owner admins with limited permissions (managed via a
+// separate list from ADMIN_TELEGRAM_IDS, which remains the full-owner list).
+
+async function getAllStaff() {
+  const s = readCollection('staff');
+  return s;
+}
+
+async function addStaff(telegramId, permissions) {
+  await updateCollectionAtomic('staff', (staff) => {
+    staff[String(telegramId)] = {
+      telegramId: String(telegramId),
+      permissions: permissions || ['products', 'orders'], // default limited scope
+      addedAt: Date.now()
+    };
+  });
+}
+
+async function removeStaff(telegramId) {
+  await updateCollectionAtomic('staff', (staff) => {
+    delete staff[String(telegramId)];
+  });
+}
+
+async function isStaff(telegramId) {
+  const staff = readCollection('staff');
+  return !!staff[String(telegramId)];
+}
+
+async function getStaffPermissions(telegramId) {
+  const staff = readCollection('staff');
+  return staff[String(telegramId)]?.permissions || [];
+}
+
+module.exports = {
+  getUser,
+  createUserIfNotExists,
+  getUserByReferralCode,
+  getAllUsers,
+  getWalletBalance,
+  creditWallet,
+  debitWallet,
+  banUser,
+  unbanUser,
+  isUserBanned,
+  getAllProducts,
+  getProductsByCategory,
+  getAllCategories,
+  getProduct,
+  searchProducts,
+  createProduct,
+  updateProduct,
+  deleteProduct,
+  incrementProductViews,
+  decrementStock,
+  checkLowStock,
+  addReview,
+  getProductReviews,
+  getProductAvgRating,
+  getCoupon,
+  validateCoupon,
+  incrementCouponUsage,
+  createCoupon,
+  toggleCoupon,
+  getAllCoupons,
+  createOrder,
+  updateOrderStatus,
+  getOrder,
+  getOrderByPayRef,
+  getUserOrders,
+  getAllOrders,
+  hasUserBoughtProduct,
+  getBoughtOrder,
+  requestRefund,
+  processRefund,
+  getSalesReport,
+  getReferralSettings,
+  setReferralSettings,
+  processReferralBonus,
+  getProPlanSettings,
+  setProPlanSettings,
+  activateProPlan,
+  isUserVip,
+  getVipDaysLeft,
+  getBotSettings,
+  updateBotSettings,
+  getCheckInSettings,
+  setCheckInSettings,
+  performCheckIn,
+  getTopBuyers,
+  getTopReferrers,
+  getUserAnalytics,
+  queueBroadcast,
+  queueDm,
+  getBroadcastQueue,
+  getDmQueue,
+  updateBroadcastEntry,
+  updateDmEntry,
+  deleteBroadcastEntry,
+  deleteDmEntry,
+  getFullBackup,
+  restoreFromBackup,
+  setUserField,
+  getUserField,
+  clearUserField,
+  getUserWalletTransactions,
+  getPendingOrdersByMethod,
+  getAllStaff,
+  addStaff,
+  removeStaff,
+  isStaff,
+  getStaffPermissions,
+  isAdmin
+};
