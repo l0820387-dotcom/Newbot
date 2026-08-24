@@ -511,6 +511,375 @@ bot.action('menu_orders', async (ctx) => {
 async function renderOrderStatus(ctx) {
   const telegramId = ctx.from.id;
   const orders = await fb.getUserOrders(telegramId);
+  const// Blocks all bot interaction until user joins every required channel.
+// Skips the check itself for the "check_joined" button so users can retry.
+
+bot.use(async (ctx, next) => {
+  if (!ctx.from) return next();
+
+  // Let the "I've Joined" button always through (it does the check itself)
+  if (ctx.callbackQuery && ctx.callbackQuery.data === 'check_joined') return next();
+
+  const settings = await fb.getBotSettings();
+  const requiredChannels = (settings.channels || []).filter(c => c.required && c.username);
+  if (requiredChannels.length === 0) return next();
+
+  const notJoined = await getUnjoinedChannels(ctx.from.id, requiredChannels);
+  if (notJoined.length > 0) {
+    // If they arrived via a deep-link (e.g. a shared product URL), remember
+    // it so we can send them there after they finish joining, instead of
+    // dropping them on the generic main menu.
+    if (ctx.startPayload) {
+      await fb.setUserField(ctx.from.id, 'pendingDeepLink', ctx.startPayload);
+    }
+    await sendJoinPrompt(ctx, notJoined);
+    return; // block everything else
+  }
+
+  return next();
+});
+
+async function checkChannelMembership(telegramId, channelUsername) {
+  try {
+    const handle = channelUsername.startsWith('@') ? channelUsername : `@${channelUsername}`;
+    const member = await bot.telegram.getChatMember(handle, telegramId);
+    return ['member', 'administrator', 'creator'].includes(member.status);
+  } catch (err) {
+    console.error(`Channel membership check failed for ${channelUsername}:`, err.message);
+    // If the bot isn't an admin in the channel or channel is misconfigured,
+    // fail open for that channel so a config mistake doesn't block everyone.
+    return true;
+  }
+}
+
+async function getUnjoinedChannels(telegramId, channels) {
+  const results = [];
+  for (const ch of channels) {
+    const isMember = await checkChannelMembership(telegramId, ch.username);
+    if (!isMember) results.push(ch);
+  }
+  return results;
+}
+
+async function sendJoinPrompt(ctx, channels) {
+  const buttons = channels.map(ch => {
+    const handle = ch.username.startsWith('@') ? ch.username.slice(1) : ch.username;
+    return [Markup.button.url(`📢 Join ${ch.label || handle}`, `https://t.me/${handle}`)];
+  });
+  buttons.push([Markup.button.callback('✅ I\'ve Joined All', 'check_joined')]);
+
+  await ctx.reply(
+    `📢 *Ek chhota sa step baaki hai!*\n\nBot use karne se pehle neeche diye channel(s) join karo:`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
+  );
+}
+
+bot.action('check_joined', async (ctx) => {
+  const settings = await fb.getBotSettings();
+  const requiredChannels = (settings.channels || []).filter(c => c.required && c.username);
+  const notJoined = await getUnjoinedChannels(ctx.from.id, requiredChannels);
+
+  if (notJoined.length === 0) {
+    await ctx.answerCbQuery('✅ Verified!');
+    const telegramId = ctx.from.id;
+    await fb.createUserIfNotExists(telegramId, ctx.from, null);
+
+    // If they arrived via a product deep-link before joining, send them
+    // straight to that product now instead of the generic main menu.
+    const pendingPayload = await fb.getUserField(telegramId, 'pendingDeepLink');
+    if (pendingPayload) {
+      await fb.clearUserField(telegramId, 'pendingDeepLink');
+      if (pendingPayload.startsWith('PROD_')) {
+        const productId = pendingPayload.slice('PROD_'.length);
+        const product = await fb.getProduct(productId);
+        if (product) {
+          await fb.incrementProductViews(productId);
+          pushNav(telegramId, `viewproduct_${productId}`);
+          return sendProductCard(ctx, productId, product);
+        }
+      }
+    }
+
+    await sendMainMenu(ctx);
+  } else {
+    await ctx.answerCbQuery('❌ Abhi bhi kuch channels join nahi kiye.', { show_alert: true });
+  }
+});
+
+// ============ START / REGISTER ============
+
+bot.start(async (ctx) => {
+  const telegramId = ctx.from.id;
+  const payload = ctx.startPayload; // e.g. REF123456 (referral) or PROD_<productId> (direct product link)
+
+  const isProductLink = payload && payload.startsWith('PROD_');
+  const referralCode = isProductLink ? null : payload;
+
+  await fb.createUserIfNotExists(telegramId, ctx.from, referralCode);
+
+  if (isProductLink) {
+    const productId = payload.slice('PROD_'.length);
+    const product = await fb.getProduct(productId);
+    if (product) {
+      await fb.incrementProductViews(productId);
+      pushNav(telegramId, `viewproduct_${productId}`);
+      return sendProductCard(ctx, productId, product);
+    }
+    // Product not found (deleted/invalid link) — fall through to normal menu
+  }
+
+  await sendMainMenu(ctx);
+});
+
+async function sendMainMenu(ctx) {
+  const settings = await fb.getBotSettings();
+  const text = settings.welcomeMessage.replace('{name}', ctx.from.first_name);
+
+  await smartReply(ctx, text, mainMenu(settings));
+}
+
+// Default labels for the built-in menu buttons — admin can override any of
+// these from the Bot Settings > Menu Buttons panel without touching code.
+const DEFAULT_MENU_LABELS = {
+  profile: '👤 My Profile',
+  browse: '🛍 Browse Products',
+  free: '🎁 Free Products',
+  proplan: '👑 Pro Plan',
+  purchases: '📦 My Purchases',
+  orders: '📋 Order Status',
+  referrals: '🔗 My Referrals',
+  stats: '📊 My Stats',
+  paymenthistory: '🧾 Payment History',
+  support: '📞 Support',
+  language: '🌐 Hindi / English',
+  checkin: '🎯 Daily Check-in',
+  leaderboard: '🏆 Leaderboard'
+};
+
+function mainMenu(settings) {
+  const labels = { ...DEFAULT_MENU_LABELS, ...(settings?.menuLabels || {}) };
+
+  const rows = [
+    [Markup.button.callback(labels.profile, 'menu_profile')],
+    [Markup.button.callback(labels.browse, 'menu_browse')],
+    [Markup.button.callback(labels.free, 'menu_free')],
+    [Markup.button.callback(labels.proplan, 'menu_proplan'), Markup.button.callback(labels.purchases, 'menu_purchases')],
+    [Markup.button.callback(labels.orders, 'menu_orders'), Markup.button.callback(labels.referrals, 'menu_referrals')],
+    [Markup.button.callback(labels.stats, 'menu_stats'), Markup.button.callback(labels.paymenthistory, 'menu_paymenthistory')],
+    [Markup.button.callback(labels.checkin, 'menu_checkin'), Markup.button.callback(labels.leaderboard, 'menu_leaderboard')],
+    [Markup.button.callback(labels.support, 'menu_support'), Markup.button.callback(labels.language, 'menu_language')]
+  ];
+
+  // Admin-configured custom link buttons on the main menu (e.g. "Join Community").
+  // Supports multiple — each one is its own row.
+  const customButtons = Array.isArray(settings?.menuCustomButtons) ? settings.menuCustomButtons : [];
+  customButtons.forEach(btn => {
+    if (btn.text && btn.url) rows.push([Markup.button.url(`🔗 ${btn.text}`, btn.url)]);
+  });
+
+  return Markup.inlineKeyboard(rows);
+}
+
+bot.action('menu_home', async (ctx) => {
+  await ctx.answerCbQuery();
+  navStack[ctx.from.id] = ['menu_home']; // reset stack — Home always starts fresh
+  await sendMainMenu(ctx);
+});
+
+// ============ MY PROFILE ============
+
+bot.action('menu_profile', async (ctx) => {
+  await ctx.answerCbQuery();
+  pushNav(ctx.from.id, 'menu_profile');
+  await renderProfile(ctx);
+});
+
+async function renderProfile(ctx) {
+  const telegramId = ctx.from.id;
+  let user = await fb.getUser(telegramId);
+
+  // Safety net: user record should always exist after /start, but if it's
+  // somehow missing, create it now instead of crashing the whole handler
+  // silently (which was the root cause of "everything disappears").
+  if (!user) {
+    user = await fb.createUserIfNotExists(telegramId, ctx.from, null);
+  }
+
+  const balance = await fb.getWalletBalance(telegramId);
+  const isVip = await fb.isUserVip(telegramId);
+  const vipDays = isVip ? await fb.getVipDaysLeft(telegramId) : 0;
+  const orders = await fb.getUserOrders(telegramId);
+  const orderCount = Object.keys(orders).length;
+
+  const vipLine = isVip ? `👑 VIP Active — ${vipDays} days left` : '👤 Free User';
+
+  const msg = `👤 *My Profile*\n\n✨ Name: ${mdEscape(user.name)}\n🔖 Username: ${user.username ? '@' + mdEscape(user.username) : '-'}\n🆔 Telegram ID: \`${telegramId}\`\n\n${vipLine}\n💰 Wallet: ₹${balance}\n📦 Total Orders: ${orderCount}\n🔗 Referral Code: \`${user.referralCode}\``;
+
+  await smartReply(ctx, msg, backButton(ctx));
+}
+
+function backButton(ctx) {
+  const telegramId = ctx?.from?.id;
+  const stack = telegramId ? navStack[telegramId] : null;
+  const canGoBack = stack && stack.length > 1;
+
+  const row = canGoBack
+    ? [Markup.button.callback('⬅️ Back', 'nav_back'), Markup.button.callback('🏠 Home', 'menu_home')]
+    : [Markup.button.callback('🏠 Home', 'menu_home')];
+
+  return Markup.inlineKeyboard([row]);
+}
+
+// Generic handler: pops the nav stack and shows the previous screen directly.
+// We call the underlying screen-render functions directly (not re-dispatching
+// fake Telegram events, which is fragile). Supports both simple no-argument
+// screens and dynamic ones (category name, product id) parsed from the target.
+bot.action('nav_back', async (ctx) => {
+  await ctx.answerCbQuery();
+  const telegramId = ctx.from.id;
+  const target = popNav(telegramId);
+
+  // Dynamic targets: cat_<CategoryName>, viewproduct_<id>
+  if (target.startsWith('cat_')) {
+    const category = target.slice(4);
+    return renderCategoryProducts(ctx, category);
+  }
+  if (target.startsWith('viewproduct_')) {
+    const productId = target.slice('viewproduct_'.length);
+    const product = await fb.getProduct(productId);
+    if (product) return sendProductCard(ctx, productId, product);
+    return sendMainMenu(ctx);
+  }
+
+  const screenRenderers = {
+    menu_home: () => sendMainMenu(ctx),
+    menu_profile: () => renderProfile(ctx),
+    menu_browse: () => showCategories(ctx),
+    menu_free: () => renderFreeProducts(ctx),
+    menu_proplan: () => renderProPlan(ctx),
+    menu_purchases: () => renderPurchases(ctx),
+    menu_orders: () => renderOrderStatus(ctx),
+    menu_referrals: () => sendReferralInfo(ctx),
+    menu_stats: () => renderStats(ctx),
+    menu_paymenthistory: () => renderPaymentHistory(ctx),
+    menu_support: () => renderSupport(ctx),
+    menu_language: () => renderLanguage(ctx),
+    menu_checkin: () => renderCheckIn(ctx),
+    menu_leaderboard: () => renderLeaderboard(ctx)
+  };
+
+  const renderer = screenRenderers[target];
+  if (renderer) return renderer();
+  return sendMainMenu(ctx);
+});
+
+// ============ PRO PLAN ============
+
+bot.action('menu_proplan', async (ctx) => {
+  await ctx.answerCbQuery();
+  pushNav(ctx.from.id, 'menu_proplan');
+  await renderProPlan(ctx);
+});
+
+async function renderProPlan(ctx) {
+  const telegramId = ctx.from.id;
+  const settings = await fb.getProPlanSettings();
+  const isVip = await fb.isUserVip(telegramId);
+
+  if (isVip) {
+    const daysLeft = await fb.getVipDaysLeft(telegramId);
+    return smartReply(
+      ctx,
+      `👑 *You're already VIP!*\n\n✨ ${daysLeft} days remaining.\n\nWant to extend? Buy again to add more days.`,
+      navButtons([[Markup.button.callback(`💳 Extend — ₹${settings.price}`, 'buyproplan')]], telegramId)
+    );
+  }
+
+  const msg = `👑 *Upgrade to VIP*\n\n💰 ₹${settings.price} · ${settings.description}\n\n✨ *What you unlock:*\n✅ ${settings.durationDays} din unlimited downloads\n✅ Koi bhi paid product FREE\n✅ Wallet balance ki zarurat nahi\n✅ Naye products bhi free\n\n🛡 Secure UPI payment · Instant activation`;
+
+  await smartReply(ctx, msg, navButtons([[Markup.button.callback(`💳 Upgrade Now — ₹${settings.price}`, 'buyproplan')]], telegramId));
+}
+
+bot.action('buyproplan', async (ctx) => {
+  const telegramId = ctx.from.id;
+  const settings = await fb.getProPlanSettings();
+
+  await ctx.answerCbQuery('Generating payment link...');
+  await smartReply(ctx, '⏳ *Payment link generate ho raha hai...*', navButtons([[Markup.button.callback('❌ Cancel', 'menu_home')]], telegramId));
+
+  const order = await fb.createOrder({
+    userId: String(telegramId),
+    productId: 'PRO_PLAN',
+    productName: `Pro Plan (${settings.durationDays} days)`,
+    amount: settings.price,
+    paymentMethod: 'zabupi',
+    isProPlan: true,
+    proPlanDuration: settings.durationDays
+  });
+
+  const payment = await zabupi.createPaymentOrder({
+    orderId: order.payRef,
+    amount: settings.price,
+    userId: telegramId,
+    userName: ctx.from.first_name,
+    purpose: 'Pro Plan Subscription'
+  });
+
+  if (!payment.success) {
+    await fb.updateOrderStatus(order.id, 'failed');
+    console.error('ZapUPI Pro Plan payment failed for order', order.id, ':', payment.error);
+    return smartReply(
+      ctx,
+      `❌ *Payment link generate nahi ho paya*\n\nWajah: ${mdEscape(typeof payment.error === 'string' ? payment.error : JSON.stringify(payment.error))}\n\nThodi der baad try karo ya support se contact karo.`,
+      navButtons([[Markup.button.callback('🔄 Try Again', 'buyproplan')]], telegramId)
+    );
+  }
+
+  await fb.updateOrderStatus(order.id, 'pending', { zabupiTxnId: payment.transactionId });
+
+  await smartReply(
+    ctx,
+    `💳 *Pro Plan* — ₹${settings.price}\n\n✨ Pay karke turant VIP activate ho jayega ✅`,
+    Markup.inlineKeyboard([
+      [Markup.button.url('💳 Pay Now', payment.paymentUrl)],
+      [Markup.button.callback('❌ Cancel Order', `cancelorder_${order.id}`), Markup.button.callback('🏠 Home', 'menu_home')]
+    ])
+  );
+});
+
+// ============ FREE PRODUCTS ============
+
+bot.action('menu_free', async (ctx) => {
+  await ctx.answerCbQuery();
+  pushNav(ctx.from.id, 'menu_free');
+  await renderFreeProducts(ctx);
+});
+
+async function renderFreeProducts(ctx) {
+  const telegramId = ctx.from.id;
+  const all = await fb.getAllProducts(true);
+  const freeEntries = Object.entries(all).filter(([id, p]) => p.price === 0);
+
+  if (freeEntries.length === 0) {
+    return smartReply(ctx, '🎁 Abhi koi free product available nahi hai. Jaldi aayega! 🙏', backButton(ctx));
+  }
+
+  const buttons = freeEntries.map(([id, p]) => [Markup.button.callback(`🎁 ${p.name} | FREE`, `viewproduct_${id}`)]);
+
+  await smartReply(ctx, '✨ 「 *Free Products* 」\n\n✨ Tap any product to view full details.', navButtons(buttons, telegramId));
+}
+
+// ============ ORDER STATUS ============
+
+bot.action('menu_orders', async (ctx) => {
+  await ctx.answerCbQuery();
+  pushNav(ctx.from.id, 'menu_orders');
+  await renderOrderStatus(ctx);
+});
+
+async function renderOrderStatus(ctx) {
+  const telegramId = ctx.from.id;
+  const orders = await fb.getUserOrders(telegramId);
   const list = Object.values(orders).sort((a, b) => b.createdAt - a.createdAt);
 
   if (list.length === 0) {
