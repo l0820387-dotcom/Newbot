@@ -207,26 +207,21 @@ function setupAdminPanel(bot, fb, mdEscape) {
   bot.action('admin_orders', async (ctx) => {
     if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery();
-    await sendOrdersMenu(ctx);
+    await sendOrdersMenu(ctx, 'all', 0);
   });
 
-  async function sendOrdersMenu(ctx, filter = 'all') {
+  async function sendOrdersMenu(ctx, filter = 'all', page = 0) {
     const orders = await fb.getAllOrders();
     let list = Object.entries(orders).sort((a, b) => (b[1].createdAt || 0) - (a[1].createdAt || 0));
     if (filter !== 'all') list = list.filter(([, o]) => o.status === filter);
 
-    let text = `🧾 *Orders* (${list.length}${filter !== 'all' ? ` ${filter}` : ''})\n\n`;
-    if (list.length === 0) {
-      text += '_No orders in this category._';
-    } else {
-      list.slice(0, 15).forEach(([id, o]) => {
-        const emoji = o.status === 'delivered' ? '✅' : o.status === 'pending' ? '⏳' : o.status === 'failed' ? '❌' : o.status === 'refunded' ? '↩️' : '🔄';
-        text += `${emoji} ${mdEscape(o.productName)} — ₹${o.amount} _(${o.userId})_\n`;
-      });
-      if (list.length > 15) text += `\n_...and ${list.length - 15} more_`;
-    }
+    const pageSize = 10;
+    const pageItems = list.slice(page * pageSize, (page + 1) * pageSize);
 
-    const buttons = Markup.inlineKeyboard([
+    let text = `🧾 *Orders* (${list.length}${filter !== 'all' ? ` ${filter}` : ''})\n\nTap any order for full details:`;
+    if (list.length === 0) text += '\n\n_No orders in this category._';
+
+    const buttons = [
       [
         Markup.button.callback('All', 'admin_orderf_all'),
         Markup.button.callback('✅ Success', 'admin_orderf_delivered'),
@@ -235,18 +230,64 @@ function setupAdminPanel(bot, fb, mdEscape) {
       [
         Markup.button.callback('❌ Failed', 'admin_orderf_failed'),
         Markup.button.callback('↩️ Refunded', 'admin_orderf_refunded')
-      ],
-      [Markup.button.callback('⬅️ Back', 'admin_home')]
-    ]);
+      ]
+    ];
 
-    try { await ctx.editMessageText(text, { parse_mode: 'Markdown', ...buttons }); }
-    catch (e) { await ctx.reply(text, { parse_mode: 'Markdown', ...buttons }); }
+    pageItems.forEach(([id, o]) => {
+      const emoji = o.status === 'delivered' ? '✅' : o.status === 'pending' ? '⏳' : o.status === 'failed' ? '❌' : o.status === 'refunded' ? '↩️' : '🔄';
+      const label = `${emoji} ${o.productName} — ₹${o.amount} (${o.userId})`;
+      buttons.push([Markup.button.callback(label.slice(0, 60), `admin_orderdetail_${id}`)]);
+    });
+
+    const navRow = [];
+    if (page > 0) navRow.push(Markup.button.callback('⬅️ Prev', `admin_orderpage_${filter}_${page - 1}`));
+    if ((page + 1) * pageSize < list.length) navRow.push(Markup.button.callback('Next ➡️', `admin_orderpage_${filter}_${page + 1}`));
+    if (navRow.length) buttons.push(navRow);
+    buttons.push([Markup.button.callback('⬅️ Back', 'admin_home')]);
+
+    try { await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+    catch (e) { await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
   }
 
   bot.action(/^admin_orderf_(.+)$/, async (ctx) => {
     if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery();
-    await sendOrdersMenu(ctx, ctx.match[1]);
+    await sendOrdersMenu(ctx, ctx.match[1], 0);
+  });
+
+  bot.action(/^admin_orderpage_(\w+)_(\d+)$/, async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    await ctx.answerCbQuery();
+    await sendOrdersMenu(ctx, ctx.match[1], parseInt(ctx.match[2]));
+  });
+
+  bot.action(/^admin_orderdetail_(.+)$/, async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    const orderId = ctx.match[1];
+    const o = await fb.getOrder(orderId);
+    if (!o) return ctx.answerCbQuery('Not found.');
+    await ctx.answerCbQuery();
+
+    const emoji = o.status === 'delivered' ? '✅' : o.status === 'pending' ? '⏳' : o.status === 'failed' ? '❌' : o.status === 'refunded' ? '↩️' : '🔄';
+    let text = `${emoji} *Order Details*\n\n`;
+    text += `📦 Product: ${mdEscape(o.productName)}\n`;
+    text += `💰 Amount: ₹${o.amount}${o.originalAmount && o.originalAmount !== o.amount ? ` (original ₹${o.originalAmount})` : ''}\n`;
+    text += `👤 User: \`${o.userId}\`\n`;
+    text += `💳 Method: ${o.paymentMethod || 'unknown'}\n`;
+    text += `📊 Status: ${o.status}\n`;
+    if (o.utr) text += `🔢 UTR: \`${o.utr}\`\n`;
+    if (o.couponUsed) text += `🎟 Coupon: \`${o.couponUsed}\`\n`;
+    if (o.refundStatus) text += `↩️ Refund: ${o.refundStatus}\n`;
+    text += `📅 Created: ${o.createdAt ? new Date(o.createdAt).toLocaleString() : '-'}\n`;
+    if (o.deliveredAt) text += `📬 Delivered: ${new Date(o.deliveredAt).toLocaleString()}\n`;
+
+    await ctx.reply(text, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('👤 View User', `admin_viewuser_${o.userId}`)],
+        [Markup.button.callback('⬅️ Back to Orders', 'admin_orders')]
+      ])
+    });
   });
 
   // ============ USERS ============
@@ -254,11 +295,50 @@ function setupAdminPanel(bot, fb, mdEscape) {
   bot.action('admin_users', async (ctx) => {
     if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery();
-    adminState[ctx.from.id] = { step: 'awaiting_user_lookup' };
-    await ctx.reply('👥 *Users*\n\nSend a Telegram ID to view details, or use:\n/ban <id> <reason>\n/unban <id>\n/msg <id> <message>', {
-      parse_mode: 'Markdown',
-      ...adminBackButton('admin_home')
+    await sendUsersList(ctx, 0);
+  });
+
+  async function sendUsersList(ctx, page) {
+    const users = await fb.getAllUsers();
+    const entries = Object.entries(users).sort((a, b) => (b[1].joinedAt || 0) - (a[1].joinedAt || 0));
+    const pageSize = 8;
+    const pageItems = entries.slice(page * pageSize, (page + 1) * pageSize);
+
+    let text = `👥 *Users* (${entries.length} total)\n\nTap a user to view full details:`;
+
+    const buttons = pageItems.map(([id, u]) => {
+      const label = `${u.banned ? '🚫 ' : ''}${u.name || 'Unknown'}${u.username ? ' (@' + u.username + ')' : ''} — ₹${u.walletBalance || 0}`;
+      return [Markup.button.callback(label.slice(0, 60), `admin_viewuser_${id}`)];
     });
+
+    const navRow = [];
+    if (page > 0) navRow.push(Markup.button.callback('⬅️ Prev', `admin_userspage_${page - 1}`));
+    if ((page + 1) * pageSize < entries.length) navRow.push(Markup.button.callback('Next ➡️', `admin_userspage_${page + 1}`));
+    if (navRow.length) buttons.push(navRow);
+    buttons.push([Markup.button.callback('🔍 Search by ID', 'admin_usersearch')]);
+    buttons.push([Markup.button.callback('⬅️ Back', 'admin_home')]);
+
+    try { await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+    catch (e) { await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+  }
+
+  bot.action(/^admin_userspage_(\d+)$/, async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    await ctx.answerCbQuery();
+    await sendUsersList(ctx, parseInt(ctx.match[1]));
+  });
+
+  bot.action(/^admin_viewuser_(.+)$/, async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    await ctx.answerCbQuery();
+    await sendUserDetails(ctx, ctx.match[1]);
+  });
+
+  bot.action('admin_usersearch', async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    await ctx.answerCbQuery();
+    adminState[ctx.from.id] = { step: 'awaiting_user_lookup' };
+    await ctx.reply('🔍 Send a Telegram ID to view details:', adminBackButton('admin_users'));
   });
 
   async function sendUserDetails(ctx, telegramId) {
@@ -266,8 +346,32 @@ function setupAdminPanel(bot, fb, mdEscape) {
     if (!analytics) return ctx.reply('⚠️ User not found.');
 
     const isVip = analytics.isVip && analytics.vipExpiresAt > Date.now();
-    const text = `👤 *${mdEscape(analytics.name)}* ${analytics.username ? '(@' + mdEscape(analytics.username) + ')' : ''}\n\n` +
-      `🆔 \`${telegramId}\`\n💰 Wallet: ₹${analytics.walletBalance || 0}\n📦 Orders: ${analytics.totalOrders} (${analytics.completedOrders} completed)\n💎 Total Spent: ₹${analytics.totalSpent}\n🔗 Referred: ${analytics.referredCount} users\n${isVip ? '👑 VIP Active' : '👤 Not VIP'}\n${analytics.banned ? '🚫 Banned' : '✅ Active'}`;
+    const orders = await fb.getUserOrders(telegramId);
+    const orderList = Object.values(orders).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    const statusCounts = {};
+    orderList.forEach(o => { statusCounts[o.status] = (statusCounts[o.status] || 0) + 1; });
+    const statusLine = Object.entries(statusCounts).map(([s, c]) => `${s}: ${c}`).join(', ') || 'none';
+
+    let text = `👤 *${mdEscape(analytics.name)}* ${analytics.username ? '(@' + mdEscape(analytics.username) + ')' : ''}\n\n`;
+    text += `🆔 Telegram ID: \`${telegramId}\`\n`;
+    text += `📅 Joined: ${analytics.joinedAt ? new Date(analytics.joinedAt).toLocaleDateString() : 'unknown'}\n`;
+    text += `💰 Wallet Balance: ₹${analytics.walletBalance || 0}\n`;
+    text += `📦 Total Orders: ${analytics.totalOrders} (${statusLine})\n`;
+    text += `💎 Total Spent: ₹${analytics.totalSpent}\n`;
+    text += `🔗 Referral Code: \`${analytics.referralCode || 'none'}\`\n`;
+    text += `👥 Referred By: ${analytics.referredBy ? '`' + analytics.referredBy + '`' : 'nobody (direct signup)'}\n`;
+    text += `🤝 Users They Referred: ${analytics.referredCount}\n`;
+    text += `🎯 Check-in Streak: ${analytics.checkInStreak || 0} days\n`;
+    text += `${isVip ? `👑 VIP Active (expires ${new Date(analytics.vipExpiresAt).toLocaleDateString()})` : '👤 Not VIP'}\n`;
+    text += `${analytics.banned ? `🚫 Banned — reason: ${mdEscape(analytics.banReason || 'not given')}` : '✅ Not banned'}\n`;
+
+    if (orderList.length > 0) {
+      text += `\n📋 *Recent Orders:*\n`;
+      orderList.slice(0, 5).forEach(o => {
+        const emoji = o.status === 'delivered' ? '✅' : o.status === 'pending' ? '⏳' : o.status === 'failed' ? '❌' : o.status === 'refunded' ? '↩️' : '🔄';
+        text += `${emoji} ${mdEscape(o.productName)} — ₹${o.amount}\n`;
+      });
+    }
 
     await ctx.reply(text, {
       parse_mode: 'Markdown',
@@ -275,7 +379,7 @@ function setupAdminPanel(bot, fb, mdEscape) {
         [Markup.button.callback('💰 Adjust Wallet', `admin_wallet_${telegramId}`)],
         [analytics.banned ? Markup.button.callback('✅ Unban', `admin_unban_${telegramId}`) : Markup.button.callback('🚫 Ban', `admin_banuser_${telegramId}`)],
         [Markup.button.callback('📩 Message', `admin_msguser_${telegramId}`)],
-        [Markup.button.callback('⬅️ Back', 'admin_home')]
+        [Markup.button.callback('⬅️ Back to List', 'admin_users')]
       ])
     });
   }
@@ -463,8 +567,52 @@ function setupAdminPanel(bot, fb, mdEscape) {
   bot.action('admin_dm', async (ctx) => {
     if (!(await isAdminOrStaff(ctx))) return;
     await ctx.answerCbQuery();
+    await sendDmUserPicker(ctx, 0);
+  });
+
+  async function sendDmUserPicker(ctx, page) {
+    const users = await fb.getAllUsers();
+    const entries = Object.entries(users).sort((a, b) => (b[1].joinedAt || 0) - (a[1].joinedAt || 0));
+    const pageSize = 8;
+    const pageItems = entries.slice(page * pageSize, (page + 1) * pageSize);
+
+    let text = `📩 *Direct Message*\n\nSelect a user to message (${entries.length} total):`;
+
+    const buttons = pageItems.map(([id, u]) => {
+      const label = `${u.name || 'Unknown'}${u.username ? ' (@' + u.username + ')' : ''} — \`${id}\``;
+      return [Markup.button.callback(label.replace(/`/g, '').slice(0, 60), `admin_dmpick_${id}`)];
+    });
+
+    const navRow = [];
+    if (page > 0) navRow.push(Markup.button.callback('⬅️ Prev', `admin_dmpage_${page - 1}`));
+    if ((page + 1) * pageSize < entries.length) navRow.push(Markup.button.callback('Next ➡️', `admin_dmpage_${page + 1}`));
+    if (navRow.length) buttons.push(navRow);
+    buttons.push([Markup.button.callback('🔍 Search by ID instead', 'admin_dmbyid')]);
+    buttons.push([Markup.button.callback('⬅️ Back', 'admin_home')]);
+
+    try { await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+    catch (e) { await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }); }
+  }
+
+  bot.action(/^admin_dmpage_(\d+)$/, async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    await ctx.answerCbQuery();
+    await sendDmUserPicker(ctx, parseInt(ctx.match[1]));
+  });
+
+  bot.action(/^admin_dmpick_(.+)$/, async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    const telegramId = ctx.match[1];
+    await ctx.answerCbQuery();
+    adminState[ctx.from.id] = { step: 'dm_message', data: { telegramId } };
+    await ctx.reply(`📩 Message for \`${telegramId}\`? Type it now:`, { parse_mode: 'Markdown' });
+  });
+
+  bot.action('admin_dmbyid', async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    await ctx.answerCbQuery();
     adminState[ctx.from.id] = { step: 'dm_userid', data: {} };
-    await ctx.reply('📩 *Direct Message*\n\nEnter the Telegram ID to message:', { parse_mode: 'Markdown', ...adminBackButton('admin_home') });
+    await ctx.reply('📩 Enter the Telegram ID to message:', adminBackButton('admin_dm'));
   });
 
   // ============ BOT SETTINGS ============
@@ -483,10 +631,64 @@ function setupAdminPanel(bot, fb, mdEscape) {
           [Markup.button.callback(settings.maintenanceMode ? '🟢 Disable Maintenance' : '🔴 Enable Maintenance', 'admin_togglemaintenance')],
           [Markup.button.callback('📢 Manage Channels', 'admin_channels')],
           [Markup.button.callback('💬 Set Support Info', 'admin_setsupport')],
+          [Markup.button.callback('💳 Payment Settings', 'admin_paymentsettings')],
           [Markup.button.callback('⬅️ Back', 'admin_home')]
         ])
       });
     } catch (e) { await ctx.reply(text, { parse_mode: 'Markdown' }); }
+  });
+
+  // ============ PAYMENT SETTINGS (FamPay) ============
+
+  bot.action('admin_paymentsettings', async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    await ctx.answerCbQuery();
+    await sendPaymentSettingsMenu(ctx);
+  });
+
+  async function sendPaymentSettingsMenu(ctx) {
+    const s = await fb.getPaymentSettings();
+    const maskedKey = s.apiKey ? s.apiKey.slice(0, 12) + '...' + s.apiKey.slice(-4) : 'not set';
+    const text = `💳 *Payment Settings (FamPay)*\n\n🔑 API Key: \`${maskedKey}\`\n🌐 Base URL: ${mdEscape(s.baseUrl)}\n💰 UPI ID: \`${s.upiId || 'not set'}\`\n📜 T&C: ${s.termsAndConditions ? 'set' : 'not set'}`;
+
+    const buttons = Markup.inlineKeyboard([
+      [Markup.button.callback('🔑 Edit API Key', 'admin_editfamkey')],
+      [Markup.button.callback('🌐 Edit Base URL', 'admin_editfamurl')],
+      [Markup.button.callback('💰 Edit UPI ID', 'admin_editfamupi')],
+      [Markup.button.callback('📜 Edit Terms & Conditions', 'admin_editfamtc')],
+      [Markup.button.callback('⬅️ Back', 'admin_settings')]
+    ]);
+
+    try { await ctx.editMessageText(text, { parse_mode: 'Markdown', ...buttons }); }
+    catch (e) { await ctx.reply(text, { parse_mode: 'Markdown', ...buttons }); }
+  }
+
+  bot.action('admin_editfamkey', async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    await ctx.answerCbQuery();
+    adminState[ctx.from.id] = { step: 'awaiting_fam_apikey' };
+    await ctx.reply('🔑 Send the new FamPay API key:');
+  });
+
+  bot.action('admin_editfamurl', async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    await ctx.answerCbQuery();
+    adminState[ctx.from.id] = { step: 'awaiting_fam_baseurl' };
+    await ctx.reply('🌐 Send the new FamPay base URL:');
+  });
+
+  bot.action('admin_editfamupi', async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    await ctx.answerCbQuery();
+    adminState[ctx.from.id] = { step: 'awaiting_fam_upi' };
+    await ctx.reply('💰 Send the new UPI ID (e.g. yourname@fam):');
+  });
+
+  bot.action('admin_editfamtc', async (ctx) => {
+    if (!(await isOwner(ctx))) return;
+    await ctx.answerCbQuery();
+    adminState[ctx.from.id] = { step: 'awaiting_fam_tc' };
+    await ctx.reply('📜 Send the new Terms & Conditions text (shown to users before every payment). Markdown formatting supported:');
   });
 
   bot.action('admin_setwelcome', async (ctx) => {
@@ -1051,6 +1253,32 @@ function setupAdminPanel(bot, fb, mdEscape) {
     if (state.step === 'awaiting_user_lookup') {
       delete adminState[ctx.from.id];
       await sendUserDetails(ctx, text);
+      return true;
+    }
+
+    // ---- Payment Settings (FamPay) ----
+    if (state.step === 'awaiting_fam_apikey') {
+      await fb.updatePaymentSettings({ apiKey: text });
+      delete adminState[ctx.from.id];
+      await ctx.reply('✅ FamPay API key updated.');
+      return true;
+    }
+    if (state.step === 'awaiting_fam_baseurl') {
+      await fb.updatePaymentSettings({ baseUrl: text });
+      delete adminState[ctx.from.id];
+      await ctx.reply('✅ FamPay base URL updated.');
+      return true;
+    }
+    if (state.step === 'awaiting_fam_upi') {
+      await fb.updatePaymentSettings({ upiId: text });
+      delete adminState[ctx.from.id];
+      await ctx.reply(`✅ UPI ID updated to \`${text}\`.`, { parse_mode: 'Markdown' });
+      return true;
+    }
+    if (state.step === 'awaiting_fam_tc') {
+      await fb.updatePaymentSettings({ termsAndConditions: text });
+      delete adminState[ctx.from.id];
+      await ctx.reply('✅ Terms & Conditions updated.');
       return true;
     }
 

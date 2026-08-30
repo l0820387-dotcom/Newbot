@@ -30,7 +30,8 @@ const FILES = {
   checkInSettings: 'checkInSettings.json',
   broadcastQueue: 'broadcastQueue.json',
   dmQueue: 'dmQueue.json',
-  staff: 'staff.json'
+  staff: 'staff.json',
+  paymentSettings: 'paymentSettings.json'
 };
 
 // ---- Low-level file read/write with an in-process write queue so
@@ -534,6 +535,35 @@ async function processReferralBonus(buyerTelegramId, orderAmount) {
 
 // ================= PRO PLAN / VIP =================
 
+// ================= PAYMENT SETTINGS (FamPay) =================
+// Lets the admin override the .env values from inside the bot — the .env
+// values are used as the initial defaults on first run.
+
+async function getPaymentSettings() {
+  const s = readCollection('paymentSettings');
+  if (Object.keys(s).length) return s;
+  return {
+    apiKey: process.env.FAMPAY_API_KEY || '',
+    baseUrl: process.env.FAMPAY_BASE_URL || 'https://payment-getaway-bot-production.up.railway.app',
+    upiId: process.env.FAMPAY_UPI_ID || '',
+    termsAndConditions: '📜 *Payment Terms & Conditions*\n\n1. Payment is non-refundable once the product is delivered.\n2. Verification may take up to 30 seconds after you submit your UTR.\n3. Do not close this chat until you receive confirmation.\n4. In case of a failed payment, contact support with your UTR number.'
+  };
+}
+
+async function updatePaymentSettings(updates) {
+  return updateCollectionAtomic('paymentSettings', (current) => {
+    const hasData = Object.keys(current).length > 0;
+    const base = hasData ? current : {
+      apiKey: process.env.FAMPAY_API_KEY || '',
+      baseUrl: process.env.FAMPAY_BASE_URL || 'https://payment-getaway-bot-production.up.railway.app',
+      upiId: process.env.FAMPAY_UPI_ID || '',
+      termsAndConditions: '📜 *Payment Terms & Conditions*\n\n1. Payment is non-refundable once the product is delivered.\n2. Verification may take up to 30 seconds after you submit your UTR.\n3. Do not close this chat until you receive confirmation.\n4. In case of a failed payment, contact support with your UTR number.'
+    };
+    const merged = { ...base, ...updates };
+    return { __replaceWith: merged, __value: merged };
+  });
+}
+
 async function getProPlanSettings() {
   const s = readCollection('proPlanSettings');
   return Object.keys(s).length ? s : { price: 1499, durationDays: 30, active: true, description: '30 days of unlimited downloads' };
@@ -893,6 +923,8 @@ module.exports = {
   getReferralSettings,
   setReferralSettings,
   processReferralBonus,
+  getPaymentSettings,
+  updatePaymentSettings,
   getProPlanSettings,
   setProPlanSettings,
   activateProPlan,

@@ -2,7 +2,7 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const express = require('express');
 const fb = require('./localdb');
-const zabupi = require('./zabupi');
+const fampay = require('./fampay');
 const { setupAdminPanel } = require('./adminPanel');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -435,47 +435,57 @@ bot.action('buyproplan', async (ctx) => {
   const telegramId = ctx.from.id;
   const settings = await fb.getProPlanSettings();
 
-  await ctx.answerCbQuery('Generating payment link...');
-  await smartReply(ctx, '⏳ *Payment link generate ho raha hai...*', navButtons([[Markup.button.callback('❌ Cancel', 'menu_home')]], telegramId));
+  await ctx.answerCbQuery();
+  const paymentSettings = await fb.getPaymentSettings();
+  const tcText = paymentSettings.termsAndConditions || 'Payment is final once activated.';
+
+  await smartReply(
+    ctx,
+    `${tcText}\n\n👑 *Pro Plan* — ₹${settings.price}\n\nContinue to payment?`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback('✅ I Agree, Continue', 'agreepayproplan')],
+      [Markup.button.callback('❌ Cancel', 'menu_home')]
+    ])
+  );
+});
+
+bot.action('agreepayproplan', async (ctx) => {
+  const telegramId = ctx.from.id;
+  const settings = await fb.getProPlanSettings();
+
+  await ctx.answerCbQuery('Generating QR...');
+  await deleteTriggerMessage(ctx);
+
+  const paymentSettings = await fb.getPaymentSettings();
+  const qr = await fampay.generateQr(paymentSettings.upiId, settings.price, paymentSettings);
 
   const order = await fb.createOrder({
     userId: String(telegramId),
     productId: 'PRO_PLAN',
     productName: `Pro Plan (${settings.durationDays} days)`,
     amount: settings.price,
-    paymentMethod: 'zabupi',
+    paymentMethod: 'fampay',
     isProPlan: true,
     proPlanDuration: settings.durationDays
   });
 
-  const payment = await zabupi.createPaymentOrder({
-    orderId: order.payRef,
-    amount: settings.price,
-    userId: telegramId,
-    userName: ctx.from.first_name,
-    purpose: 'Pro Plan Subscription'
-  });
-
-  if (!payment.success) {
+  if (!qr.success) {
     await fb.updateOrderStatus(order.id, 'failed');
-    console.error('ZapUPI Pro Plan payment failed for order', order.id, ':', payment.error);
-    return smartReply(
-      ctx,
-      `❌ *Payment link generate nahi ho paya*\n\nWajah: ${mdEscape(typeof payment.error === 'string' ? payment.error : JSON.stringify(payment.error))}\n\nThodi der baad try karo ya support se contact karo.`,
-      navButtons([[Markup.button.callback('🔄 Try Again', 'buyproplan')]], telegramId)
+    console.error('FamPay Pro Plan QR failed for order', order.id, ':', qr.error);
+    return ctx.reply(
+      `❌ *QR generate nahi ho paya*\n\nWajah: ${mdEscape(typeof qr.error === 'string' ? qr.error : JSON.stringify(qr.error))}\n\nThodi der baad try karo.`,
+      { parse_mode: 'Markdown', ...navButtons([[Markup.button.callback('🔄 Try Again', 'buyproplan')]], telegramId) }
     );
   }
 
-  await fb.updateOrderStatus(order.id, 'pending', { zabupiTxnId: payment.transactionId });
+  await fb.updateOrderStatus(order.id, 'pending', { famOrderId: qr.orderId });
+  userState[telegramId] = { step: 'awaiting_utr', data: { orderId: order.id } };
 
-  await smartReply(
-    ctx,
-    `💳 *Pro Plan* — ₹${settings.price}\n\n✨ Pay karke turant VIP activate ho jayega ✅`,
-    Markup.inlineKeyboard([
-      [Markup.button.url('💳 Pay Now', payment.paymentUrl)],
-      [Markup.button.callback('❌ Cancel Order', `cancelorder_${order.id}`), Markup.button.callback('🏠 Home', 'menu_home')]
-    ])
-  );
+  await ctx.replyWithPhoto(qr.qrImageUrl, {
+    caption: `📱 *Scan & Pay* — ₹${settings.price}\n\nPro Plan (${settings.durationDays} days)\n\n1️⃣ QR scan karke payment karo\n2️⃣ Payment ke baad UTR number is chat mein bhejo\n3️⃣ Verification ~30 sec mein ho jayega\n\n⏱ QR 10 minute mein expire ho jayega.`,
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel Order', `cancelorder_${order.id}`)]])
+  });
 });
 
 // ============ FREE PRODUCTS ============
@@ -1175,7 +1185,7 @@ bot.action(/^paywallet_([^_]+)(?:_(.+))?$/, async (ctx) => {
   }
 });
 
-// ---- Pay via Zabupi ----
+// ---- Pay via FamPay ----
 bot.action(/^payzabupi_([^_]+)(?:_(.+))?$/, async (ctx) => {
   const productId = ctx.match[1];
   const couponCode = ctx.match[2];
@@ -1199,10 +1209,44 @@ bot.action(/^payzabupi_([^_]+)(?:_(.+))?$/, async (ctx) => {
     }
   }
 
-  await ctx.answerCbQuery('Generating payment link...');
-  // Edit the SAME message through the whole flow (loading → result) so
-  // nothing gets left behind in the chat.
-  await smartReply(ctx, '⏳ *Payment link generate ho raha hai...*', navButtons([[Markup.button.callback('❌ Cancel', 'menu_home')]], telegramId));
+  await ctx.answerCbQuery();
+
+  const paymentSettings = await fb.getPaymentSettings();
+  const tcText = paymentSettings.termsAndConditions || 'Payment is final once product is delivered.';
+
+  await smartReply(
+    ctx,
+    `${tcText}\n\n💳 *${mdEscape(product.name)}* — ₹${finalPrice}\n\nContinue to payment?`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback('✅ I Agree, Continue', `agreepay_${productId}${couponCode ? '_' + couponCode : ''}`)],
+      [Markup.button.callback('❌ Cancel', 'menu_home')]
+    ])
+  );
+});
+
+// ---- After T&C agreement: create order + generate QR ----
+bot.action(/^agreepay_([^_]+)(?:_(.+))?$/, async (ctx) => {
+  const productId = ctx.match[1];
+  const couponCode = ctx.match[2];
+  const telegramId = ctx.from.id;
+  const product = await fb.getProduct(productId);
+  if (!product) return ctx.answerCbQuery('Product not found.');
+
+  let finalPrice = product.price;
+  let couponUsed = null;
+  if (couponCode) {
+    const check = await fb.validateCoupon(couponCode, product.price);
+    if (check.valid) {
+      finalPrice = Math.max(0, product.price - check.discount);
+      couponUsed = couponCode;
+    }
+  }
+
+  await ctx.answerCbQuery('Generating QR...');
+  await deleteTriggerMessage(ctx);
+
+  const paymentSettings = await fb.getPaymentSettings();
+  const qr = await fampay.generateQr(paymentSettings.upiId, finalPrice, paymentSettings);
 
   const order = await fb.createOrder({
     userId: String(telegramId),
@@ -1211,7 +1255,7 @@ bot.action(/^payzabupi_([^_]+)(?:_(.+))?$/, async (ctx) => {
     amount: finalPrice,
     originalAmount: product.price,
     couponUsed: couponUsed || null,
-    paymentMethod: 'zabupi',
+    paymentMethod: 'fampay',
     productSnapshot: {
       deliveryType: product.deliveryType,
       fileId: product.fileId || null,
@@ -1219,45 +1263,29 @@ bot.action(/^payzabupi_([^_]+)(?:_(.+))?$/, async (ctx) => {
     }
   });
 
-  const payment = await zabupi.createPaymentOrder({
-    orderId: order.payRef,
-    amount: finalPrice,
-    userId: telegramId,
-    userName: ctx.from.first_name,
-    purpose: product.name
-  });
-
-  if (!payment.success) {
+  if (!qr.success) {
     await fb.updateOrderStatus(order.id, 'failed');
-    console.error('ZapUPI payment creation failed for order', order.id, ':', payment.error);
-    return smartReply(
-      ctx,
-      `❌ *Payment link generate nahi ho paya*\n\nWajah: ${mdEscape(typeof payment.error === 'string' ? payment.error : JSON.stringify(payment.error))}\n\nThodi der baad try karo ya support se contact karo.`,
-      navButtons([[Markup.button.callback('🔄 Try Again', `payzabupi_${productId}${couponCode ? '_' + couponCode : ''}`)]], telegramId)
+    console.error('FamPay QR generation failed for order', order.id, ':', qr.error);
+    return ctx.reply(
+      `❌ *QR generate nahi ho paya*\n\nWajah: ${mdEscape(typeof qr.error === 'string' ? qr.error : JSON.stringify(qr.error))}\n\nThodi der baad try karo ya support se contact karo.`,
+      { parse_mode: 'Markdown', ...navButtons([[Markup.button.callback('🔄 Try Again', `payzabupi_${productId}${couponCode ? '_' + couponCode : ''}`)]], telegramId) }
     );
   }
 
-  await fb.updateOrderStatus(order.id, 'pending', { zabupiTxnId: payment.transactionId });
+  await fb.updateOrderStatus(order.id, 'pending', { famOrderId: qr.orderId });
+  userState[telegramId] = { step: 'awaiting_utr', data: { orderId: order.id } };
 
-  const sentMsg = await smartReply(
-    ctx,
-    `💳 *Payment link ready!*\n\n${mdEscape(product.name)} — ₹${finalPrice}\n\n👇 Neeche link pe click karke payment complete karo.\n\n✅ Payment hote hi (10-20 sec mein) product yahin turant deliver ho jaayega — payment ke baad browser tab band karke seedha Telegram pe wapas aa jao.`,
-    Markup.inlineKeyboard([
-      [Markup.button.url('💳 Pay Now', payment.paymentUrl)],
-      [Markup.button.callback('❌ Cancel Order', `cancelorder_${order.id}`), Markup.button.callback('🏠 Home', 'menu_home')]
+  const caption = `📱 *Scan & Pay* — ₹${finalPrice}\n\n${mdEscape(product.name)}\n\n1️⃣ QR scan karke payment karo\n2️⃣ Payment ke baad UTR number is chat mein bhejo\n3️⃣ Verification ~30 sec mein ho jayega\n\n⏱ QR 10 minute mein expire ho jayega.`;
+
+  await ctx.replyWithPhoto(qr.qrImageUrl, {
+    caption,
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('❌ Cancel Order', `cancelorder_${order.id}`)]
     ])
-  );
-
-  // Save this message's location so the background payment poller can edit
-  // it directly into a success message once payment completes — instead of
-  // leaving the "Pay Now" screen stuck in the chat.
-  if (sentMsg) {
-    await fb.updateOrderStatus(order.id, 'pending', {
-      paymentMsgChatId: sentMsg.chat.id,
-      paymentMsgId: sentMsg.message_id
-    });
-  }
+  });
 });
+
 
 // ---- Cancel a pending order ----
 bot.action(/^cancelorder_(.+)$/, async (ctx) => {
@@ -1479,6 +1507,36 @@ bot.on('text', async (ctx) => {
   const state = userState[ctx.from.id];
   if (!state) return; // ignore, no active flow
 
+  if (state.step === 'awaiting_utr') {
+    const utr = ctx.message.text.trim();
+
+    if (!/^\d{6,20}$/.test(utr)) {
+      return ctx.reply('⚠️ Yeh UTR number sahi nahi lag raha. UTR sirf numbers ka hota hai (usually 12 digits). Bank ke payment confirmation mein "UTR" ya "Reference No." dhundo aur wahi bhejo.');
+    }
+
+    delete userState[ctx.from.id];
+    const order = await fb.getOrder(state.data.orderId);
+    if (!order) return ctx.reply('⚠️ Order not found. Support se contact karo.');
+
+    await ctx.reply('⏳ UTR verify ho raha hai, ~30 second lagenge...');
+
+    const paymentSettings = await fb.getPaymentSettings();
+    const submission = await fampay.submitUtr({
+      amount: order.amount,
+      utr,
+      referenceId: order.id,
+      orderId: order.famOrderId
+    }, paymentSettings);
+
+    if (!submission.success) {
+      await ctx.reply(`❌ UTR submit nahi ho paya: ${mdEscape(submission.error || 'unknown error')}\n\nSupport se contact karo.`, { parse_mode: 'Markdown' });
+      return;
+    }
+
+    await fb.updateOrderStatus(order.id, 'pending', { famTxnId: submission.txnId, utr });
+    return; // the polling loop (checkAndProcessOrder) picks this up and delivers on success
+  }
+
   if (state.step === 'awaiting_search_query') {
     delete userState[ctx.from.id];
     const query = ctx.message.text.trim();
@@ -1552,34 +1610,51 @@ bot.on('text', async (ctx) => {
 
     delete userState[ctx.from.id];
 
-    const order = await fb.createOrder({
-      userId: String(ctx.from.id),
-      productId: 'WALLET_TOPUP',
-      productName: 'Wallet Top-up',
-      amount,
-      paymentMethod: 'zabupi'
-    });
-
-    const payment = await zabupi.createPaymentOrder({
-      orderId: order.payRef,
-      amount,
-      userId: ctx.from.id,
-      userName: ctx.from.first_name,
-      purpose: 'Wallet Top-up'
-    });
-
-    if (!payment.success) {
-      await fb.updateOrderStatus(order.id, 'failed');
-      return ctx.reply('❌ Payment link generate nahi ho paya. Try again.');
-    }
-
-    await fb.updateOrderStatus(order.id, 'pending', { zabupiTxnId: payment.transactionId, isWalletTopup: true });
+    const paymentSettings = await fb.getPaymentSettings();
+    const tcText = paymentSettings.termsAndConditions || 'Payment is final once added.';
 
     await ctx.reply(
-      `💳 Add ₹${amount} to wallet`,
-      Markup.inlineKeyboard([[Markup.button.url('💳 Pay Now', payment.paymentUrl)]])
+      `${tcText}\n\n💰 *Add ₹${amount} to Wallet*\n\nContinue to payment?`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('✅ I Agree, Continue', `agreetopup_${amount}`)], [Markup.button.callback('❌ Cancel', 'menu_home')]])
+      }
     );
   }
+});
+
+bot.action(/^agreetopup_(\d+)$/, async (ctx) => {
+  const amount = parseInt(ctx.match[1]);
+  const telegramId = ctx.from.id;
+
+  await ctx.answerCbQuery('Generating QR...');
+  await deleteTriggerMessage(ctx);
+
+  const paymentSettings = await fb.getPaymentSettings();
+  const qr = await fampay.generateQr(paymentSettings.upiId, amount, paymentSettings);
+
+  const order = await fb.createOrder({
+    userId: String(telegramId),
+    productId: 'WALLET_TOPUP',
+    productName: 'Wallet Top-up',
+    amount,
+    paymentMethod: 'fampay',
+    isWalletTopup: true
+  });
+
+  if (!qr.success) {
+    await fb.updateOrderStatus(order.id, 'failed');
+    return ctx.reply('❌ QR generate nahi ho paya. Try again.');
+  }
+
+  await fb.updateOrderStatus(order.id, 'pending', { famOrderId: qr.orderId });
+  userState[telegramId] = { step: 'awaiting_utr', data: { orderId: order.id } };
+
+  await ctx.replyWithPhoto(qr.qrImageUrl, {
+    caption: `📱 *Scan & Pay* — ₹${amount}\n\nWallet Top-up\n\n1️⃣ QR scan karke payment karo\n2️⃣ Payment ke baad UTR number is chat mein bhejo\n3️⃣ Verification ~30 sec mein ho jayega`,
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel Order', `cancelorder_${order.id}`)]])
+  });
 });
 
 // ============ ADMIN API — Bot Profile Management ============
@@ -1638,21 +1713,22 @@ async function checkAndProcessOrder(orderId) {
   if (order.status === 'delivered' || order.status === 'paid') {
     return { processed: false, reason: 'already_done' };
   }
+  if (!order.famTxnId) return { processed: false, reason: 'no_utr_yet' }; // UTR not submitted yet
 
-  const statusCheck = await zabupi.checkPaymentStatus(order.payRef || orderId);
-  const statusData = statusCheck?.data || statusCheck;
-  const status = statusData ? String(statusData.status).toLowerCase() : null;
+  const paymentSettings = await fb.getPaymentSettings();
+  const statusCheck = await fampay.checkVerificationStatus(order.famTxnId, paymentSettings);
+  const status = statusCheck ? String(statusCheck.status).toLowerCase() : null;
 
-  if (status === 'failed') {
+  if (status === 'failed' || status === 'cancelled') {
     await fb.updateOrderStatus(orderId, 'failed');
-    return { processed: true, reason: 'failed' };
+    await replacePaymentMessage(order, `❌ *Payment ${status === 'cancelled' ? 'Cancelled' : 'Failed'}*\n\nUTR match nahi hua ya order expire ho gaya. Support se contact karo agar payment kata hai.`);
+    return { processed: true, reason: status };
   }
   if (status !== 'success') {
     return { processed: false, reason: 'still_pending' }; // keep polling
   }
 
-  const transaction_id = statusData.txn_id || null;
-  await fb.updateOrderStatus(orderId, 'paid', { zabupiTxnId: transaction_id });
+  await fb.updateOrderStatus(orderId, 'paid', { famVerifiedAt: Date.now() });
 
   // Turn the "Pay Now / Cancel" message into a clean success confirmation —
   // removes the buttons so the user can't tap a stale Pay Now / Cancel after
@@ -1735,7 +1811,7 @@ async function replacePaymentMessage(order, text) {
 setInterval(async () => {
   try {
     const cutoff = Date.now() - 60 * 60 * 1000; // only check orders from the last hour
-    const pending = await fb.getPendingOrdersByMethod('zabupi', cutoff);
+    const pending = await fb.getPendingOrdersByMethod('fampay', cutoff);
 
     for (const [orderId] of pending) {
       await checkAndProcessOrder(orderId);
@@ -1745,23 +1821,7 @@ setInterval(async () => {
   }
 }, 20000);
 
-app.post('/webhook/zabupi', async (req, res) => {
-  try {
-    const payRef = req.body.order_id;
-    if (!payRef) return res.status(400).send('Missing order_id');
-
-    const order = await fb.getOrderByPayRef(payRef);
-    if (!order) return res.status(404).send('Order not found');
-
-    await checkAndProcessOrder(order.id);
-    res.status(200).send('OK');
-  } catch (err) {
-    console.error('Webhook error:', err);
-    res.status(500).send('Error');
-  }
-});
-
-// Premium auto-redirect landing pages. These are OUR pages — if ZapUPI ever
+// Premium auto-redirect landing pages. These are OUR pages — if FamPay ever
 // starts honoring a redirect field, or if you link users here manually,
 // this sends them straight back into the bot instead of leaving them
 // stranded on a static confirmation page.
