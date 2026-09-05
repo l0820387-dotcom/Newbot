@@ -1119,7 +1119,7 @@ bot.action(/^applycoupon_(.+)$/, async (ctx) => {
 });
 
 // ---- Pay via Wallet ----
-bot.action(/^paywallet_([^_]+)(?:_(.+))?$/, async (ctx) => {
+bot.action(/^paywallet_(prod_[a-z0-9]+|PRO_PLAN)(?:_(.+))?$/, async (ctx) => {
   const productId = ctx.match[1];
   const couponCode = ctx.match[2];
   const telegramId = ctx.from.id;
@@ -1186,7 +1186,7 @@ bot.action(/^paywallet_([^_]+)(?:_(.+))?$/, async (ctx) => {
 });
 
 // ---- Pay via FamPay ----
-bot.action(/^payzabupi_([^_]+)(?:_(.+))?$/, async (ctx) => {
+bot.action(/^payzabupi_(prod_[a-z0-9]+|PRO_PLAN)(?:_(.+))?$/, async (ctx) => {
   const productId = ctx.match[1];
   const couponCode = ctx.match[2];
   const telegramId = ctx.from.id;
@@ -1225,7 +1225,7 @@ bot.action(/^payzabupi_([^_]+)(?:_(.+))?$/, async (ctx) => {
 });
 
 // ---- After T&C agreement: create order + generate QR ----
-bot.action(/^agreepay_([^_]+)(?:_(.+))?$/, async (ctx) => {
+bot.action(/^agreepay_(prod_[a-z0-9]+|PRO_PLAN)(?:_(.+))?$/, async (ctx) => {
   const productId = ctx.match[1];
   const couponCode = ctx.match[2];
   const telegramId = ctx.from.id;

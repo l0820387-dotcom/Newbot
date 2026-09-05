@@ -192,15 +192,122 @@ function setupAdminPanel(bot, fb, mdEscape) {
     await ctx.reply('📦 *Add Product*\n\nStep 1/8 — Product name?', { parse_mode: 'Markdown' });
   });
 
+  // ---- Edit product: pick a single field to change instead of a full wizard ----
   bot.action(/^admin_editprod_(.+)$/, async (ctx) => {
     if (!(await isAdminOrStaff(ctx))) return;
     const productId = ctx.match[1];
     const p = await fb.getProduct(productId);
     if (!p) return ctx.answerCbQuery('Not found.');
     await ctx.answerCbQuery();
-    adminState[ctx.from.id] = { step: 'prod_name', data: { isEdit: true, productId, ...p } };
-    await ctx.reply(`✏️ *Edit Product*\n\nCurrent name: ${mdEscape(p.name)}\n\nStep 1/8 — New name? (or send "skip" to keep current)`, { parse_mode: 'Markdown' });
+    await sendEditFieldMenu(ctx, productId, p);
   });
+
+  async function sendEditFieldMenu(ctx, productId, p) {
+    const text = `✏️ *Edit — ${mdEscape(p.name)}*\n\nKaunsi field change karni hai? (sirf wahi update hogi, baaki sab waisa hi rahega)`;
+    const buttons = Markup.inlineKeyboard([
+      [Markup.button.callback(`Name: ${p.name.slice(0, 20)}`, `admin_editfield_name_${productId}`)],
+      [Markup.button.callback(`Price: ₹${p.price}`, `admin_editfield_price_${productId}`)],
+      [Markup.button.callback(`Category: ${p.category}`, `admin_editfield_category_${productId}`)],
+      [Markup.button.callback('Description', `admin_editfield_description_${productId}`)],
+      [Markup.button.callback(`Stock: ${p.stock === -1 || p.stock === undefined ? 'Unlimited' : p.stock}`, `admin_editfield_stock_${productId}`)],
+      [Markup.button.callback(`Delivery: ${p.deliveryType === 'file' ? '📎 File' : '🔗 Link'}`, `admin_editfield_deliverytype_${productId}`)],
+      [Markup.button.callback(p.deliveryType === 'file' ? '📎 Replace File' : '🔗 Change Link', `admin_editfield_deliveryvalue_${productId}`)],
+      [Markup.button.callback('🖼 Change Image', `admin_editfield_image_${productId}`)],
+      [Markup.button.callback('⬅️ Back', `admin_prod_${productId}`)]
+    ]);
+    try { await ctx.editMessageText(text, { parse_mode: 'Markdown', ...buttons }); }
+    catch (e) { await ctx.reply(text, { parse_mode: 'Markdown', ...buttons }); }
+  }
+
+  const EDIT_FIELD_PROMPTS = {
+    name: 'Naya *name* bhejo:',
+    price: 'Naya *price* bhejo (₹, 0 for free):',
+    category: 'Nayi *category* bhejo:',
+    description: 'Nayi *description* bhejo:',
+    stock: 'Nayi *stock quantity* bhejo (-1 for unlimited):',
+    deliverytype: 'Delivery type "file" ya "link"?',
+    deliveryvalue: null, // depends on current deliveryType, filled in below
+    image: 'Nayi product *image* (photo) bhejo:'
+  };
+
+  bot.action(/^admin_editfield_([a-z]+)_(.+)$/, async (ctx) => {
+    if (!(await isAdminOrStaff(ctx))) return;
+    const field = ctx.match[1];
+    const productId = ctx.match[2];
+    const p = await fb.getProduct(productId);
+    if (!p) return ctx.answerCbQuery('Not found.');
+    await ctx.answerCbQuery();
+
+    adminState[ctx.from.id] = { step: 'prod_editfield', data: { field, productId } };
+
+    if (field === 'deliveryvalue') {
+      const prompt = p.deliveryType === 'file'
+        ? 'Nayi *file* bhejo (as document):'
+        : 'Naya *download link* (URL) bhejo:';
+      return ctx.reply(prompt, { parse_mode: 'Markdown' });
+    }
+
+    if (field === 'deliverytype') {
+      return ctx.reply(EDIT_FIELD_PROMPTS.deliverytype, Markup.keyboard(['file', 'link']).oneTime().resize());
+    }
+
+    await ctx.reply(EDIT_FIELD_PROMPTS[field], { parse_mode: 'Markdown' });
+  });
+
+  // Handles the single-field edit text replies (name/price/category/description/stock/deliverytype/link)
+  async function handleEditFieldText(ctx, state, text) {
+    const { field, productId } = state.data;
+    const p = await fb.getProduct(productId);
+    if (!p) { delete adminState[ctx.from.id]; await ctx.reply('⚠️ Product no longer exists.'); return true; }
+
+    const updates = {};
+
+    switch (field) {
+      case 'name':
+        updates.name = text;
+        break;
+      case 'price': {
+        const price = parseInt(text);
+        if (isNaN(price)) { await ctx.reply('⚠️ Valid number daalo.'); return true; }
+        updates.price = price;
+        break;
+      }
+      case 'category':
+        updates.category = text;
+        break;
+      case 'description':
+        updates.description = text;
+        break;
+      case 'stock': {
+        const stock = parseInt(text);
+        updates.stock = isNaN(stock) ? -1 : stock;
+        break;
+      }
+      case 'deliverytype': {
+        const type = text.toLowerCase();
+        if (type !== 'file' && type !== 'link') { await ctx.reply('⚠️ Reply "file" or "link".'); return true; }
+        updates.deliveryType = type;
+        break;
+      }
+      case 'deliveryvalue':
+        if (p.deliveryType === 'link') {
+          updates.deliveryLink = text;
+        } else {
+          await ctx.reply('⚠️ Please send the file as a document, not text.');
+          return true;
+        }
+        break;
+      default:
+        return false;
+    }
+
+    await fb.updateProduct(productId, updates);
+    delete adminState[ctx.from.id];
+    await ctx.reply('✅ Updated!', Markup.removeKeyboard());
+    const updated = await fb.getProduct(productId);
+    await sendEditFieldMenu(ctx, productId, updated);
+    return true;
+  }
 
   // ============ ORDERS ============
 
@@ -1064,7 +1171,12 @@ function setupAdminPanel(bot, fb, mdEscape) {
 
     const text = ctx.message.text.trim();
 
-    // ---- Product add/edit wizard ----
+    // ---- Single-field edit (from the Edit menu) ----
+    if (state.step === 'prod_editfield') {
+      return handleEditFieldText(ctx, state, text);
+    }
+
+    // ---- Product add/edit wizard (used only for "Add Product") ----
     if (state.step && state.step.startsWith('prod_')) {
       return handleProductWizard(ctx, state, text);
     }
@@ -1501,6 +1613,18 @@ function setupAdminPanel(bot, fb, mdEscape) {
     const state = adminState[ctx.from.id];
     if (!state) return false;
 
+    if (state.step === 'prod_editfield' && state.data.field === 'deliveryvalue') {
+      const { productId } = state.data;
+      const p = await fb.getProduct(productId);
+      if (!p || p.deliveryType !== 'file') { await ctx.reply('⚠️ Send text/link instead, this product uses link delivery.'); return true; }
+      await fb.updateProduct(productId, { fileId: ctx.message.document.file_id });
+      delete adminState[ctx.from.id];
+      await ctx.reply('✅ File updated!');
+      const updated = await fb.getProduct(productId);
+      await sendEditFieldMenu(ctx, productId, updated);
+      return true;
+    }
+
     if (state.step === 'prod_deliveryvalue' && state.data.deliveryType === 'file') {
       state.data.fileId = ctx.message.document.file_id;
       state.step = 'prod_image';
@@ -1530,6 +1654,16 @@ function setupAdminPanel(bot, fb, mdEscape) {
     const sizes = ctx.message.photo;
     const fileId = sizes[sizes.length - 1].file_id;
     const mediaGroupId = ctx.message.media_group_id || null;
+
+    if (state.step === 'prod_editfield' && state.data.field === 'image') {
+      const { productId } = state.data;
+      await fb.updateProduct(productId, { imageFileId: fileId, imageFileIds: [fileId] });
+      delete adminState[ctx.from.id];
+      await ctx.reply('✅ Image updated!');
+      const updated = await fb.getProduct(productId);
+      await sendEditFieldMenu(ctx, productId, updated);
+      return true;
+    }
 
     if (state.step === 'prod_image') {
       // Telegram's multi-select photo picker sends each photo as a SEPARATE
